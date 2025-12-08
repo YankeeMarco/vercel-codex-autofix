@@ -1,7 +1,6 @@
-Here is the complete README.md, formatted exactly as a Markdown file.
-You can copy & paste directly into README.md with perfect GitHub rendering.
-
-⸻
+![vercel-codex-autofix](https://img.shields.io/badge/vercel--codex--autofix-AI%20AutoFix-black?style=flat-square&logo=vercel&logoColor=white)
+![Self-Healing Build](https://img.shields.io/badge/Self--Healing-Build%20System-purple?style=flat-square&logo=githubcopilot&logoColor=white)
+![Zero Touch Deployment](https://img.shields.io/badge/Zero--Touch-Deployment-success?style=flat-square&logo=vercel)
 
 
 # 📦 vercel-codex-autofix
