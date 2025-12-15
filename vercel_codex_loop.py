@@ -3,6 +3,9 @@ import time
 from pathlib import Path
 import os
 import shutil
+import select
+import pty
+import sys
 from dotenv import load_dotenv
 from pathlib import Path
 import json
@@ -22,6 +25,7 @@ VERCEL_TOKEN = os.getenv("VERCEL_TOKEN")
 
 # Convert command string to a list
 CODEX_CMD = os.getenv("CODEX_CMD", "echo NO_CHANGES").split()
+CODEX_USE_EXEC = os.getenv("CODEX_USE_EXEC", "1") != "0"
 
 MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", 10))
 SLEEP_AFTER_PUSH_SECONDS = int(os.getenv("SLEEP_AFTER_PUSH_SECONDS", 90))
@@ -56,7 +60,7 @@ def git_workdir_has_changes() -> bool:
     return result.returncode != 0
 
 
-def run(cmd, cwd=None, input_text=None, check=True, env=None):
+def run(cmd, cwd=None, input_text=None, check=True, env=None, encoding="utf-8", errors="replace"):
     """
     Run a shell command and return stdout as text.
     Raises RuntimeError on non-zero exit code if check=True.
@@ -68,6 +72,8 @@ def run(cmd, cwd=None, input_text=None, check=True, env=None):
         text=True,
         capture_output=True,
         env=env,
+        encoding=encoding,
+        errors=errors,
     )
     if check and result.returncode != 0:
         raise RuntimeError(
@@ -75,8 +81,161 @@ def run(cmd, cwd=None, input_text=None, check=True, env=None):
             f"Exit code: {result.returncode}\n"
             f"STDOUT:\n{result.stdout}\n"
             f"STDERR:\n{result.stderr}"
-        )
+    )
     return result.stdout, result.stderr, result.returncode
+
+
+def run_with_pty(
+    cmd,
+    cwd=None,
+    input_text: str | None = None,
+    env=None,
+    stream_to_stdout: bool = False,
+    timeout_seconds: float = 120.0,
+    send_eot: bool = True,
+    auto_yes: bool = True,
+    nudge_after_silence: float = 30.0,
+) -> tuple[str, str, int]:
+    """
+    Run a command attached to a pseudo-TTY. Useful for CLIs that refuse to run
+    without a terminal (e.g., they probe cursor position).
+
+    Returns (stdout_and_stderr, "", returncode).
+    """
+    master_fd, slave_fd = pty.openpty()
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            env=env,
+            text=False,
+        )
+    finally:
+        os.close(slave_fd)
+
+    output = bytearray()
+    start = time.time()
+    last_output = start
+    last_heartbeat = start
+    timed_out = False
+    killed = False
+    terminate_at = None
+    timeout_deadline = start + timeout_seconds if timeout_seconds else None
+
+    if input_text:
+        try:
+            os.write(master_fd, input_text.encode("utf-8", errors="replace"))
+            os.write(master_fd, b"\n")
+            if send_eot:
+                # Send Ctrl-D to signal EOF to interactive programs
+                os.write(master_fd, b"\x04")
+        except OSError:
+            pass
+
+    # Read until the process exits. If the child requests cursor position
+    # (ESC[6n), respond with a dummy value to satisfy TTY probes.
+    while True:
+        now = time.time()
+        if timeout_deadline and now > timeout_deadline and not timed_out:
+            timed_out = True
+            terminate_at = now
+            print("[warn] PTY command exceeded timeout; terminating...", flush=True)
+            proc.terminate()
+        if timed_out and not killed and terminate_at and (now - terminate_at) > 3.0:
+            killed = True
+            print("[warn] PTY process did not exit; killing...", flush=True)
+            proc.kill()
+
+        ready, _, _ = select.select([master_fd], [], [], 0.1)
+        if master_fd in ready:
+            try:
+                chunk = os.read(master_fd, 1024)
+            except OSError:
+                break
+            if not chunk:
+                break
+            if b"\x1b[6n" in chunk:
+                # Respond with row 1, col 1
+                try:
+                    os.write(master_fd, b"\x1b[1;1R")
+                except OSError:
+                    pass
+                # Remove the query from captured output to keep logs clean
+                chunk = chunk.replace(b"\x1b[6n", b"")
+            output.extend(chunk)
+            if stream_to_stdout and chunk:
+                try:
+                    sys.stdout.buffer.write(chunk)
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+            if chunk:
+                last_output = now
+            # Auto-approve common prompts from tools that block on confirmation
+            if auto_yes and b"Would you like to run the following command?" in chunk:
+                try:
+                    os.write(master_fd, b"y\n")
+                except OSError:
+                    pass
+            if auto_yes and b"Press enter to confirm" in chunk:
+                try:
+                    os.write(master_fd, b"\n")
+                except OSError:
+                    pass
+
+        # Heartbeat to reassure liveness when nothing is printed
+        if (now - last_output) > 10 and (now - last_heartbeat) > 10:
+            print("[info from the loop] PTY command still running (no new output)...", flush=True)
+            last_heartbeat = now
+
+        # If totally silent for a while, send a gentle newline to nudge REPL-ish UIs
+        if nudge_after_silence and (now - last_output) > nudge_after_silence:
+            try:
+                os.write(master_fd, b"\n")
+                last_output = now
+                print("[debug from the loop] Sent newline to nudge interactive prompt.", flush=True)
+            except OSError:
+                pass
+
+        if proc.poll() is not None and not ready:
+            break
+
+    # Drain any trailing output after process exit
+    while True:
+        ready, _, _ = select.select([master_fd], [], [], 0.1)
+        if master_fd not in ready:
+            break
+        try:
+            chunk = os.read(master_fd, 1024)
+        except OSError:
+            break
+        if not chunk:
+            break
+        output.extend(chunk)
+        if stream_to_stdout and chunk:
+            try:
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+    try:
+        os.close(master_fd)
+    except OSError:
+        pass
+    if timed_out:
+        try:
+            rc = proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            rc = proc.wait()
+    else:
+        rc = proc.wait()
+    text_out = output.decode("utf-8", errors="replace")
+    return text_out, "", rc
 
 
 def fetch_latest_build_logs() -> str:
@@ -94,7 +253,7 @@ def fetch_latest_build_logs() -> str:
         print("[warn] Could not find a deployment for the current commit.")
         return ""
 
-    print(f"[info] Inspecting deployment {dep_id} ...")
+    print(f"[info from the loop] Inspecting deployment {dep_id} ...")
     cmd = ["vercel", "inspect", dep_id, "--logs", "--wait"]
 
     stdout, stderr, _ = run(cmd, cwd=REPO_PATH, check=False, env=env)
@@ -103,7 +262,7 @@ def fetch_latest_build_logs() -> str:
         print("[warn] No logs returned from Vercel for this deployment.")
         return ""
 
-    print("[info] Log snippet:")
+    print("[info from the loop] Log snippet:")
     print("\n".join(logs.splitlines()[-15:]))
     return logs
 
@@ -130,7 +289,7 @@ def get_deployment_id_for_current_commit() -> str | None:
     """
 
     commit_short = get_current_commit_hash(short=True)
-    print(f"[info] Looking for deployment of commit {commit_short}...")
+    print(f"[info from the loop] Looking for deployment of commit {commit_short}...")
 
     env = os.environ.copy()
     if VERCEL_TOKEN:
@@ -183,11 +342,11 @@ def get_deployment_id_for_current_commit() -> str | None:
         print("[warn] Could not parse any deployment IDs from `vercel list`.")
         return None
 
-    print(f"[info] Parsed {len(dep_ids)} deployment candidates from `vercel list`.")
+    print(f"[info from the loop] Parsed {len(dep_ids)} deployment candidates from `vercel list`.")
 
     # 3) For each candidate deployment, inspect it (with logs) and look for the commit hash
     for dep_id in dep_ids:
-        print(f"[debug] Inspecting deployment {dep_id} for commit {commit_short}...")
+        print(f"[debug from the loop] Inspecting deployment {dep_id} for commit {commit_short}...")
         insp_out, insp_err, _ = run(
             ["vercel", "inspect", dep_id, "--logs"],
             cwd=REPO_PATH,
@@ -196,7 +355,7 @@ def get_deployment_id_for_current_commit() -> str | None:
         )
         combined = f"{insp_out}\n{insp_err}"
         if commit_short in combined:
-            print(f"[info] Matched commit {commit_short} to deployment {dep_id}")
+            print(f"[info from the loop] Matched commit {commit_short} to deployment {dep_id}")
             return dep_id
 
     print(f"[warn] No deployment found for commit {commit_short} in {len(dep_ids)} candidates.")
@@ -238,11 +397,68 @@ def run_codex_on_logs(logs: str) -> bool:
     You *must* adapt this to however your local Codex tool behaves.
     """
     print("\n[step] Running Codex with latest build logs...")
+    # Persist latest logs to a file Codex can read (many recipes look for this).
+    logs_file = REPO_PATH / "dev_debug_logs.md"
+    try:
+        logs_file.write_text(
+            f"# Vercel build logs\n\nFetched: {time.strftime('%Y-%m-%d %H:%M:%S %Z')}\n\n```\n{logs}\n```\n",
+            encoding="utf-8",
+        )
+        print(f"[info] Wrote logs to {logs_file} for Codex context.")
+    except Exception as e:
+        print(f"[warn] Could not write logs file {logs_file}: {e}")
+
+    # Check if there were already changes before Codex runs
+    had_changes_before = git_workdir_has_changes()
+
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env.setdefault("CODEX_LOG_LEVEL", "info")
 
+    if CODEX_USE_EXEC:
+        # Non-interactive mode: use codex exec with a task payload that includes logs.
+        task = (
+            "You are Codex running in an autofix loop for a Vercel deployment.\n"
+            "Goal: diagnose the build failure from the Vercel logs and modify the repo to fix it.\n"
+            "Rules:\n"
+            "- Edit files as needed, but do NOT commit.\n"
+            "- Prefer minimal, targeted changes.\n"
+            "- If lockfile mismatches are indicated, refresh the lockfile accordingly.\n"
+            "\n"
+            "Vercel logs:\n"
+            f"{logs}\n"
+        )
+        cmd = [
+            "codex",
+            "exec",
+            "--full-auto",
+            "--sandbox",
+            "workspace-write",
+            task,
+        ]
+        stdout, stderr, returncode = run(cmd, cwd=REPO_PATH, check=False, env=env)
+
+        print("[codex stdout]")
+        print(stdout)
+        if stderr.strip():
+            print("\n[codex stderr]")
+            print(stderr)
+
+        if returncode != 0:
+            print(f"[warn] Codex exec exited with non-zero status ({returncode}).")
+            return False
+
+        has_changes_after = git_workdir_has_changes()
+        if not has_changes_after and not had_changes_before:
+            print("[info] Codex exec made no file changes.")
+            return False
+
+        print("[info] Codex exec appears to have modified the repo.")
+        return True
+
+    # --- Interactive path (legacy) ---
     def run_once(cmd: list[str], label: str):
-        print(f"[debug] Running Codex command ({label}): {' '.join(cmd)}")
+        print(f"[debug from the loop] Running Codex command ({label}): {' '.join(cmd)}")
         return run(
             cmd,
             cwd=REPO_PATH,
@@ -260,24 +476,32 @@ def run_codex_on_logs(logs: str) -> bool:
         print(stderr)
 
     combined = (stdout + stderr).lower()
-    if returncode != 0 and "stdin is not a terminal" in combined:
-        if shutil.which("script"):
-            print("[info] Codex requires a TTY; retrying via `script` to provide a pseudo-tty...")
-            wrapped_cmd = ["script", "-q", "/dev/null"] + CODEX_CMD
-            stdout, stderr, returncode = run_once(wrapped_cmd, "pty")
-            print("[codex stdout]")
-            print(stdout)
-            if stderr.strip():
-                print("\n[codex stderr]")
-                print(stderr)
-            combined = (stdout + stderr).lower()
-        else:
-            print("[warn] Codex requires a TTY but `script` is not available. Skipping Codex run.")
-            return False
+    needs_tty = (
+        "stdin is not a terminal" in combined
+        or "cursor position could not be read" in combined
+    )
+    if returncode != 0 and needs_tty:
+        print("[info from the loop] Codex requires a TTY; retrying via in-process pseudo-tty...")
+        # Ensure a sensible TERM so cursor probes don't explode
+        env["TERM"] = env.get("TERM", "xterm-256color")
+        stdout, stderr, returncode = run_with_pty(
+            CODEX_CMD,
+            cwd=REPO_PATH,
+            input_text=logs,
+            env=env,
+            stream_to_stdout=True,
+            timeout_seconds=180.0,
+        )
+        print("[codex stdout]")
+        print(stdout)
+        if stderr.strip():
+            print("\n[codex stderr]")
+            print(stderr)
+        combined = (stdout + stderr).lower()
 
     # Example convention: Codex prints "NO_CHANGES" if everything is fine
     if "NO_CHANGES" in stdout.upper():
-        print("[info] Codex reports no changes needed.")
+        print("[info from the loop] Codex reports no changes needed.")
         return False
 
     if returncode != 0:
@@ -285,7 +509,7 @@ def run_codex_on_logs(logs: str) -> bool:
               f"Treating as 'no further changes'.")
         return False
 
-    print("[info] Codex appears to have made changes.")
+    print("[info from the loop] Codex appears to have made changes.")
     return True
 
 
@@ -308,13 +532,13 @@ def git_commit_and_push() -> bool:
 
     if returncode != 0:
         if "nothing to commit" in stdout.lower() or "nothing to commit" in stderr.lower():
-            print("[info] Nothing to commit. Skipping push.")
+            print("[info from the loop] Nothing to commit. Skipping push.")
             return False
         raise RuntimeError(
             f"git commit failed unexpectedly:\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
         )
 
-    print("[info] Commit created:")
+    print("[info from the loop] Commit created:")
     print(stdout)
 
     # Push
@@ -328,7 +552,7 @@ def git_commit_and_push() -> bool:
             f"git push failed:\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
         )
 
-    print("[info] git push completed.")
+    print("[info from the loop] git push completed.")
     return True
 
 def apply_codex_fixes(logs: str) -> bool:
@@ -343,7 +567,7 @@ def apply_codex_fixes(logs: str) -> bool:
     print("\n[step] Running Codex (codex exec) to apply fixes...")
 
     if not logs.strip():
-        print("[info] No logs provided to Codex. Skipping.")
+        print("[info from the loop] No logs provided to Codex. Skipping.")
         return False
 
     # Check if there were already changes before Codex runs
@@ -393,10 +617,10 @@ def apply_codex_fixes(logs: str) -> bool:
     has_changes_after = git_workdir_has_changes()
 
     if not has_changes_after and not had_changes_before:
-        print("[info] Codex made no file changes.")
+        print("[info from the loop] Codex made no file changes.")
         return False
 
-    print("[info] Codex appears to have modified the repo.")
+    print("[info from the loop] Codex appears to have modified the repo.")
     return True
 
 # =========================
@@ -423,24 +647,24 @@ def main():
 
         # 2. If build is already clean AND we’ve looped at least once, we can stop
         if build_looks_successful(logs):
-            print("[info] Build looks successful 🎉")
+            print("[info from the loop] Build looks successful 🎉")
             print("[done] Stopping loop.")
             return
 
         # 3. Ask Codex to fix issues based on the logs
         changed = run_codex_on_logs(logs)
         if not changed:
-            print("[info] Codex has no further changes. Stopping loop.")
+            print("[info from the loop] Codex has no further changes. Stopping loop.")
             return
 
         # 4. Commit & push changes (this triggers a new Vercel deployment)
         pushed = git_commit_and_push()
         if not pushed:
-            print("[info] No code changes actually pushed. Stopping loop.")
+            print("[info from the loop] No code changes actually pushed. Stopping loop.")
             return
 
         # 5. Give Vercel time to build the new commit
-        print(f"[info] Sleeping {SLEEP_AFTER_PUSH_SECONDS}s while Vercel builds...")
+        print(f"[info from the loop] Sleeping {SLEEP_AFTER_PUSH_SECONDS}s while Vercel builds...")
         time.sleep(SLEEP_AFTER_PUSH_SECONDS)
 
     print(f"[stop] Reached MAX_ITERATIONS={MAX_ITERATIONS}. Exiting.")
