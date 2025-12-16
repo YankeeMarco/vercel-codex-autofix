@@ -14,7 +14,7 @@ dotenv.config();
 const REPO_PATH = path.resolve(process.env.REPO_PATH || ".");
 const PROD_URL = process.env.PROD_URL || "";
 const GIT_REMOTE = process.env.GIT_REMOTE || "origin";
-const GIT_BRANCH = process.env.GIT_BRANCH || "main";
+const GIT_BRANCH = process.env.GIT_BRANCH || "";
 const VERCEL_TOKEN = process.env.VERCEL_TOKEN || "";
 const VERCEL_TEAM_ID = process.env.VERCEL_TEAM_ID || "";
 const MAX_ITERATIONS = Number(process.env.MAX_ITERATIONS || 10);
@@ -29,7 +29,7 @@ type RunResult = { stdout: string; stderr: string; code: number };
 
 function run(
   cmd: string[],
-  opts: { cwd?: string; env?: NodeJS.ProcessEnv; inputText?: string } = {},
+  opts: { cwd?: string; env?: NodeJS.ProcessEnv; inputText?: string; streamOutput?: boolean } = {},
 ): Promise<RunResult> {
   return new Promise((resolve) => {
     const child = spawn(cmd[0], cmd.slice(1), {
@@ -44,8 +44,14 @@ function run(
     child.stdout.setEncoding("utf-8");
     child.stderr.setEncoding("utf-8");
 
-    child.stdout.on("data", (data) => (stdout += data));
-    child.stderr.on("data", (data) => (stderr += data));
+    child.stdout.on("data", (data) => {
+      stdout += data;
+      if (opts.streamOutput) process.stdout.write(data);
+    });
+    child.stderr.on("data", (data) => {
+      stderr += data;
+      if (opts.streamOutput) process.stderr.write(data);
+    });
 
     child.on("close", (code) => resolve({ stdout, stderr, code: code ?? 0 }));
 
@@ -67,6 +73,13 @@ async function getCurrentCommitHash(short = true): Promise<string> {
   const args = short ? ["git", "rev-parse", "--short=7", "HEAD"] : ["git", "rev-parse", "HEAD"];
   const { stdout } = await run(args, { cwd: REPO_PATH });
   return stdout.trim();
+}
+
+async function resolveGitBranch(): Promise<string> {
+  if (GIT_BRANCH) return GIT_BRANCH;
+  const { stdout, code } = await run(["git", "rev-parse", "--abbrev-ref", "HEAD"], { cwd: REPO_PATH });
+  if (code === 0 && stdout.trim()) return stdout.trim();
+  return "main";
 }
 
 async function getDeploymentIdForCurrentCommit(): Promise<string | null> {
@@ -167,15 +180,6 @@ async function runCodexOnLogs(logs: string): Promise<boolean> {
 
   const hadChangesBefore = await gitWorkdirHasChanges();
 
-  const codexEnv: Record<string, string> = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (v !== undefined) codexEnv[k] = v;
-  }
-
-  const codex = new Codex({
-    env: codexEnv,
-  });
-
   const task =
     "You are Codex running in an autofix loop for a Vercel deployment.\n" +
     "Goal: diagnose the build failure from the Vercel logs and modify the repo to fix it.\n" +
@@ -183,22 +187,47 @@ async function runCodexOnLogs(logs: string): Promise<boolean> {
     "- Edit files as needed, but do NOT commit.\n" +
     "- Prefer minimal, targeted changes.\n" +
     "- If lockfile mismatches are indicated, refresh the lockfile accordingly.\n\n" +
-    "Vercel logs:\n" +
-    logs;
+    `The logs are in ${logsPath}.\n` +
+    "Start by reading that file.";
 
-  try {
-    const thread = codex.startThread({
-      workingDirectory: REPO_PATH,
-      skipGitRepoCheck: false,
-    });
+  if (CODEX_USE_EXEC) {
+    const execEnv = { ...process.env };
+    delete execEnv.OPENAI_API_KEY; // avoid forcing API-billed mode when CLI auth is available
 
-    const turn = await thread.run(task);
+    const args = ["codex", "exec", "--full-auto", task];
+    const res = await run(args, { cwd: REPO_PATH, env: execEnv, streamOutput: true });
+
+    if (res.code !== 0) {
+      console.warn("[warn] codex exec failed:", res.stderr || res.stdout);
+      return false;
+    }
 
     console.log("[codex final response]");
-    console.log(turn.finalResponse);
-  } catch (err) {
-    console.warn("[warn] Codex run failed:", err);
-    return false;
+    console.log((res.stdout || res.stderr).trim());
+  } else {
+    const codexEnv: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (v !== undefined) codexEnv[k] = v;
+    }
+
+    const codex = new Codex({
+      env: codexEnv,
+    });
+
+    try {
+      const thread = codex.startThread({
+        workingDirectory: REPO_PATH,
+        skipGitRepoCheck: false,
+      });
+
+      const turn = await thread.run(task);
+
+      console.log("[codex final response]");
+      console.log(turn.finalResponse);
+    } catch (err) {
+      console.warn("[warn] Codex run failed:", err);
+      return false;
+    }
   }
 
   const hasChangesAfter = await gitWorkdirHasChanges();
@@ -211,7 +240,7 @@ async function runCodexOnLogs(logs: string): Promise<boolean> {
   return true;
 }
 
-async function gitCommitAndPush(): Promise<boolean> {
+async function gitCommitAndPush(branch: string): Promise<boolean> {
   console.log("\n[step] Git add/commit/push...");
 
   await run(["git", "add", "-A"], { cwd: REPO_PATH });
@@ -229,7 +258,7 @@ async function gitCommitAndPush(): Promise<boolean> {
   console.log("[info] Commit created:");
   console.log(commit.stdout);
 
-  const push = await run(["git", "push", GIT_REMOTE, GIT_BRANCH], { cwd: REPO_PATH });
+  const push = await run(["git", "push", GIT_REMOTE, branch], { cwd: REPO_PATH });
   if (push.code !== 0) {
     throw new Error(`git push failed:\n${push.stdout}\n${push.stderr}`);
   }
@@ -248,7 +277,8 @@ function sleep(ms: number) {
 async function main() {
   console.log("[start] Vercel ↔ Codex auto-fix loop (TypeScript)");
   console.log(`Repo:   ${REPO_PATH}`);
-  console.log(`Branch: ${GIT_BRANCH}`);
+  const branch = await resolveGitBranch();
+  console.log(`Branch: ${branch}`);
   console.log(`URL:    ${PROD_URL}`);
 
   for (let i = 1; i <= MAX_ITERATIONS; i++) {
@@ -275,7 +305,7 @@ async function main() {
       return;
     }
 
-    const pushed = await gitCommitAndPush();
+    const pushed = await gitCommitAndPush(branch);
     if (!pushed) {
       console.log("[info] No code changes actually pushed. Stopping loop.");
       return;
