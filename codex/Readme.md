@@ -1,0 +1,1 @@
+modify the codex config lines according to your own paths. and add them to the codex config file, such as ~/.codex/config.toml

@@ -1,0 +1,12 @@
+model = "gpt-5.1-codex-mini"
+model_reasoning_effort = "high"
+
+[general]
+log_level = "info"
+
+[projects."~/Documents/zeda_video"]
+trust_level = "trusted"
+
+[projects."~/Documents/vercel-codex-autofix"]
+trust_level = "trusted"
+
