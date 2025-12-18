@@ -28,6 +28,7 @@ This creates a closed-loop, commit-aware, zero-touch build repair system.
 🧠 Key design principles
 	•	Commit-centric (not URL-centric)
 Logs are matched to the exact Git commit, not just the production URL.
+		•	The script prefers `vercel list -m githubCommitSha=<sha>` to avoid false positives when scanning logs.
 	•	Safe automation
 Codex edits files but never commits. Git commits are done explicitly by the script.
 	•	CLI-first, version-agnostic
@@ -110,6 +111,11 @@ MAX_ITERATIONS=10
 SLEEP_AFTER_PUSH_SECONDS=90
 ```
 
+Note:
+	•	The script loads `.env` from the same directory as `vercel_codex_loop.ts` (so you can run it from any working directory).
+	•	To override, set `DOTENV_CONFIG_PATH=/path/to/.env`.
+	•	If `GIT_BRANCH` is set but doesn’t exist locally, the script falls back to your current branch.
+
 🔑 Vercel token
 
 Create at:
@@ -189,6 +195,16 @@ No infinite loops.
 	•	Add multiple Codex passes
 	•	Add structured error classification
 	•	Integrate with GitHub Actions
+
+⛑️ Troubleshooting
+	•	Codex CLI error `invalid_encrypted_content`: clear stale credentials and re-login with ChatGPT auth:
+```
+codex logout
+rm -rf ~/.codex/sessions ~/.codex/auth.json
+codex --config preferred_auth_method=chatgpt
+codex login
+codex whoami   # sanity check
+```
 
 ⸻
 

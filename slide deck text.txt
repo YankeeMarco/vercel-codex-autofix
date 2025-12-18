@@ -1,0 +1,272 @@
+⸻
+
+vercel-codex-autofix
+
+A Self-Healing Deployment Loop for Vercel
+
+⸻
+
+1. Motivation: Why this project exists
+
+Modern deployment failures are rarely hard problems.
+
+They are usually caused by:
+	•	missing imports
+	•	dependency or lockfile mismatches
+	•	misconfigured framework settings
+	•	type errors
+	•	small CI environment differences
+
+Yet each failure forces a costly manual loop:
+	1.	wait for the deployment to fail
+	2.	open logs
+	3.	search for the real error
+	4.	patch the code
+	5.	commit
+	6.	redeploy
+	7.	repeat
+
+The fix is usually trivial.
+The cycle is what wastes time.
+
+This project automates that entire cycle.
+
+⸻
+
+2. Core idea: Turn deployments into a feedback loop
+
+The key insight is simple:
+
+A deployment build already tells us what is wrong.
+
+So instead of treating deployment failures as terminal events, we treat them as signals in a loop.
+
+The system repeatedly:
+	•	observes deployment output
+	•	interprets it
+	•	applies corrective changes
+	•	redeploys
+
+Until the system converges on a successful build.
+
+This is not “AI writing random code.”
+This is feedback-driven repair.
+
+⸻
+
+3. What this system does (high-level)
+
+For the currently checked-out Git commit, the system:
+	1.	Finds the exact Vercel deployment triggered by that commit
+	2.	Fetches the build logs
+	3.	Feeds the logs into Codex (as context, not just text)
+	4.	Lets Codex apply minimal fixes to the repo
+	5.	Commits and pushes those changes
+	6.	Triggers a new deployment
+	7.	Repeats until success or safe termination
+
+This creates a closed-loop, autonomous build repair system.
+
+⸻
+
+4. A critical design decision: commit-centric, not URL-centric
+
+Most automation tools look at:
+	•	a production URL
+	•	or “latest deployment”
+
+That is fragile.
+
+Why?
+	•	Production may point to an older successful build
+	•	Newer commits may be failing silently in the background
+
+This system instead anchors everything to Git commits.
+
+The logic is:
+	•	read the current local commit hash
+	•	find the Vercel deployment that contains that commit
+	•	fetch logs from that exact deployment
+
+This guarantees we are always debugging the right build.
+
+⸻
+
+5. How deployment matching works (without fragile APIs)
+
+The system does not depend on:
+	•	undocumented Vercel APIs
+	•	version-specific --json flags
+
+Instead it:
+	1.	Runs vercel list
+	2.	Parses the CLI table output
+	3.	Extracts deployment IDs and URLs
+	4.	Inspects each deployment
+	5.	Matches against the commit hash in the logs
+
+This makes the system:
+	•	CLI-version tolerant
+	•	resilient to output changes
+	•	easy to debug manually
+
+⸻
+
+6. Fetching logs reliably
+
+Once the correct deployment is identified, logs are fetched using:
+
+vercel inspect <deployment> --logs --wait
+
+The --wait flag is important:
+	•	it blocks until logs are available
+	•	it allows the script to behave like a synchronous feedback channel
+
+A short tail of logs is printed for visibility, but the full logs are preserved.
+
+⸻
+
+7. Turning logs into agent-readable context
+
+Instead of dumping logs into a fragile prompt string, the system:
+	•	writes logs into a file inside the repo
+	•	typically dev_debug_logs.md
+
+Codex is instructed to:
+	•	read that file
+	•	reason about the failure
+	•	apply fixes accordingly
+
+This gives the agent:
+	•	stable context
+	•	full error messages
+	•	line numbers and stack traces
+
+And avoids token / formatting issues.
+
+⸻
+
+8. Codex’s role (and its limits)
+
+Codex is allowed to:
+	•	read the repository
+	•	edit files
+	•	update configs or lockfiles
+	•	apply minimal, targeted fixes
+
+Codex is not allowed to:
+	•	commit
+	•	push
+	•	alter Git history
+
+This separation is deliberate.
+
+Why?
+	•	commits are irreversible state changes
+	•	automation must remain auditable
+
+The script — not the model — owns version control.
+
+⸻
+
+9. Detecting whether progress was made
+
+Before and after Codex runs, the system checks:
+	•	unstaged Git diffs
+	•	staged Git diffs
+
+If:
+	•	no files changed
+
+Then the loop stops.
+
+This prevents:
+	•	infinite retries
+	•	hallucinated fixes
+	•	runaway automation
+
+A lack of change is treated as a signal:
+
+“The system cannot improve further with the current information.”
+
+⸻
+
+10. Commit and redeploy
+
+If changes exist:
+	•	all changes are staged
+	•	a clear, consistent commit message is created
+	•	the commit is pushed to the currently active branch
+
+This avoids:
+	•	refspec errors
+	•	hardcoded branch assumptions
+	•	detached HEAD problems
+
+The push triggers a new Vercel deployment automatically.
+
+⸻
+
+11. Loop control and safety
+
+The loop terminates if any of the following occur:
+	•	build logs indicate success
+	•	Codex makes no changes
+	•	Git has nothing to commit
+	•	maximum iterations reached
+
+This ensures:
+	•	bounded execution
+	•	predictable behavior
+	•	safe unattended operation
+
+⸻
+
+12. Why this approach is novel
+
+This project is not special because it uses AI.
+
+It is special because it combines:
+	•	deployment systems as feedback channels
+	•	commit-centric reasoning
+	•	controlled agent autonomy
+	•	explicit stop conditions
+	•	real-world CLI tooling
+
+The result is a system that:
+	•	doesn’t panic on failure
+	•	doesn’t require dashboards
+	•	doesn’t require human babysitting
+
+It simply repairs itself until it works.
+
+⸻
+
+13. How this can evolve
+
+Possible extensions include:
+	•	PR-based repair instead of direct commits
+	•	multiple repair agents in sequence
+	•	structured error classification
+	•	build-log diffing across iterations
+	•	CI runner integration
+
+But even in its current form, the system already demonstrates a powerful pattern.
+
+⸻
+
+14. Final takeaway
+
+Failures are not exceptions.
+
+They are signals.
+
+When systems are designed to:
+	•	observe failures
+	•	reason about them
+	•	act safely
+	•	and stop intelligently
+
+Automation stops being brittle — and starts being resilient.
+
+That is the core idea behind vercel-codex-autofix.

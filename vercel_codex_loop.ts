@@ -5,7 +5,39 @@ import process from "process";
 import dotenv from "dotenv";
 import { Codex } from "@openai/codex-sdk";
 
-dotenv.config();
+function loadEnv() {
+  const explicit = process.env.DOTENV_CONFIG_PATH;
+  const scriptPath = [...process.argv]
+    .reverse()
+    .find((arg) => typeof arg === "string" && (arg.endsWith(".ts") || arg.endsWith(".js")) && fs.existsSync(arg));
+  const scriptDir = scriptPath ? path.dirname(path.resolve(scriptPath)) : process.cwd();
+
+  const scriptEnv = path.join(scriptDir, ".env");
+  const cwdEnv = path.join(process.cwd(), ".env");
+
+  const envPath = explicit
+    ? path.resolve(explicit)
+    : fs.existsSync(scriptEnv)
+      ? scriptEnv
+      : fs.existsSync(cwdEnv)
+        ? cwdEnv
+        : null;
+
+  if (!envPath) {
+    console.warn("[warn] No .env found (set DOTENV_CONFIG_PATH or place a .env next to the script).");
+    return;
+  }
+
+  const res = dotenv.config({ path: envPath });
+  const count = res.parsed ? Object.keys(res.parsed).length : 0;
+  if (res.error) {
+    console.warn(`[warn] Failed to load env from ${envPath}:`, res.error);
+  } else {
+    console.log(`[info] Loaded ${count} env var(s) from ${envPath}`);
+  }
+}
+
+loadEnv();
 
 // =========================
 // CONFIGURATION
@@ -76,49 +108,98 @@ async function getCurrentCommitHash(short = true): Promise<string> {
 }
 
 async function resolveGitBranch(): Promise<string> {
-  if (GIT_BRANCH) return GIT_BRANCH;
+  if (GIT_BRANCH) {
+    const exists = await run(["git", "show-ref", "--verify", "--quiet", `refs/heads/${GIT_BRANCH}`], { cwd: REPO_PATH });
+    if (exists.code === 0) return GIT_BRANCH;
+    console.warn(`[warn] GIT_BRANCH=${GIT_BRANCH} is not a local branch. Falling back to current branch.`);
+  }
   const { stdout, code } = await run(["git", "rev-parse", "--abbrev-ref", "HEAD"], { cwd: REPO_PATH });
   if (code === 0 && stdout.trim()) return stdout.trim();
   return "main";
 }
 
+function extractDeploymentCandidates(text: string): string[] {
+  const candidates = new Set<string>();
+  {
+    const urlRe = /https?:\/\/[A-Za-z0-9-]+\.vercel\.app\b/g;
+    let match: RegExpExecArray | null;
+    while ((match = urlRe.exec(text)) !== null) candidates.add(match[0]);
+  }
+  {
+    const bareRe = /\b[A-Za-z0-9-]+\.vercel\.app\b/g;
+    let match: RegExpExecArray | null;
+    while ((match = bareRe.exec(text)) !== null) candidates.add(`https://${match[0]}`);
+  }
+  return Array.from(candidates);
+}
+
+function stripAnsi(text: string): string {
+  // ECMA-48 / ANSI escape sequences.
+  return text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
+function normalizeVercelInspectLogs(raw: string): string {
+  const withoutCliPreamble = raw
+    .split(/\r?\n/)
+    .filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return true;
+      if (trimmed.startsWith("Vercel CLI ")) return false;
+      if (trimmed.startsWith("Fetching deployment ")) return false;
+      if (trimmed.startsWith("> Fetched deployment ")) return false;
+      if (trimmed.startsWith("status\t")) return false;
+      if (trimmed.startsWith("status ")) return false;
+      return true;
+    })
+    .join("\n");
+
+  return stripAnsi(withoutCliPreamble).trim();
+}
+
 async function getDeploymentIdForCurrentCommit(): Promise<string | null> {
-  const commitShort = await getCurrentCommitHash(true);
+  const commitFull = await getCurrentCommitHash(false);
+  const commitShort = commitFull.slice(0, 7);
   console.log(`[info] Looking for deployment of commit ${commitShort}...`);
 
   const env = { ...process.env };
   if (VERCEL_TOKEN) env.VERCEL_AUTH_TOKEN = VERCEL_TOKEN;
   if (VERCEL_TEAM_ID) env.VERCEL_TEAM_ID = VERCEL_TEAM_ID;
 
-  const list = await run(["vercel", "list"], { cwd: REPO_PATH, env });
-  if (list.code !== 0 || !list.stdout.trim()) {
+  // Prefer Vercel metadata filtering to avoid false positives when scanning logs for a short SHA.
+  const listByMeta = await run(["vercel", "list", "--no-color", "--yes", "-m", `githubCommitSha=${commitFull}`], {
+    cwd: REPO_PATH,
+    env,
+  });
+  const metaCombined = `${listByMeta.stdout}\n${listByMeta.stderr}`;
+  if (listByMeta.code === 0) {
+    const metaCandidates = extractDeploymentCandidates(metaCombined);
+    if (metaCandidates.length > 0) {
+      console.log(`[info] Found ${metaCandidates.length} deployment(s) via metadata filter.`);
+      return metaCandidates[0];
+    }
+  }
+
+  const list = await run(["vercel", "list", "--no-color", "--yes"], { cwd: REPO_PATH, env });
+  const combinedList = `${list.stdout}\n${list.stderr}`;
+  if (list.code !== 0 || !combinedList.trim()) {
     console.warn("[warn] `vercel list` failed or returned no data.");
-    if (list.stderr.trim()) console.warn(list.stderr);
+    if (combinedList.trim()) console.warn(combinedList);
     return null;
   }
 
-  const candidates: string[] = [];
-  for (const line of list.stdout.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    const lower = trimmed.toLowerCase();
-    if (lower.startsWith("age") || lower.startsWith("deployment") || trimmed.startsWith("Vercel")) {
-      continue;
-    }
-    if (/^[\s┌└┼─┐┘│━]+$/.test(trimmed)) continue;
-    const first = trimmed.split(/\s+/)[0];
-    const isUrl = first.includes(".vercel.app") || first.startsWith("https://");
-    const isId = first.startsWith("dpl_") || (/^[A-Za-z0-9]+$/.test(first) && first.length >= 8);
-    if (isUrl || isId) candidates.push(first);
-  }
-
+  const candidates = extractDeploymentCandidates(combinedList);
   console.log(`[info] Parsed ${candidates.length} deployment candidates from \`vercel list\`.`);
 
+  // Fallback: inspect build logs and parse the explicit "Commit: <sha>" line from Vercel's cloning step.
+  const cloningCommitRe = /\bCommit:\s*([0-9a-f]{7,40})\b/i;
   for (const dep of candidates) {
     console.log(`[debug] Inspecting deployment ${dep} for commit ${commitShort}...`);
-    const inspect = await run(["vercel", "inspect", dep, "--logs"], { cwd: REPO_PATH, env });
-    const combined = `${inspect.stdout}\n${inspect.stderr}`;
-    if (combined.includes(commitShort)) {
+    const inspect = await run(["vercel", "inspect", dep, "--logs", "--no-color"], { cwd: REPO_PATH, env });
+    const inspectCombined = `${inspect.stdout}\n${inspect.stderr}`;
+    const match = inspectCombined.match(cloningCommitRe);
+    const inspectedCommit = match?.[1]?.toLowerCase();
+    if (!inspectedCommit) continue;
+    if (commitFull.toLowerCase().startsWith(inspectedCommit) || inspectedCommit.startsWith(commitShort.toLowerCase())) {
       console.log(`[info] Matched commit ${commitShort} to deployment ${dep}`);
       return dep;
     }
@@ -141,8 +222,10 @@ async function fetchLatestBuildLogs(): Promise<string> {
   }
 
   console.log(`[info] Inspecting deployment ${dep} ...`);
-  const res = await run(["vercel", "inspect", dep, "--logs", "--wait"], { cwd: REPO_PATH, env });
-  const logs = res.stdout.trim() ? res.stdout : res.stderr;
+  const timeout = process.env.VERCEL_INSPECT_TIMEOUT || "10m";
+  const res = await run(["vercel", "inspect", dep, "--logs", "--wait", "--timeout", timeout, "--no-color"], { cwd: REPO_PATH, env });
+  const rawLogs = `${res.stdout}\n${res.stderr}`.trim();
+  const logs = normalizeVercelInspectLogs(rawLogs) || rawLogs;
   if (!logs.trim()) {
     console.warn("[warn] No logs returned from Vercel for this deployment.");
     return "";
@@ -150,7 +233,7 @@ async function fetchLatestBuildLogs(): Promise<string> {
 
   const lines = logs.split(/\r?\n/);
   console.log("[info] Log snippet:");
-  console.log(lines.slice(-15).join("\n"));
+  console.log(lines.slice(-25).join("\n"));
   return logs;
 }
 
@@ -186,6 +269,7 @@ async function runCodexOnLogs(logs: string): Promise<boolean> {
     "Rules:\n" +
     "- Edit files as needed, but do NOT commit.\n" +
     "- Prefer minimal, targeted changes.\n" +
+    "- Do NOT rely on local node_modules or locally built artifacts; reason from the Vercel build logs and repo source.\n" +
     "- If lockfile mismatches are indicated, refresh the lockfile accordingly.\n\n" +
     `The logs are in ${logsPath}.\n` +
     "Start by reading that file.";
@@ -193,6 +277,7 @@ async function runCodexOnLogs(logs: string): Promise<boolean> {
   if (CODEX_USE_EXEC) {
     const execEnv = { ...process.env };
     delete execEnv.OPENAI_API_KEY; // avoid forcing API-billed mode when CLI auth is available
+    delete execEnv.CODEX_API_KEY; // same: prefer the logged-in Codex CLI auth
 
     const args = ["codex", "exec", "--full-auto", task];
     const res = await run(args, { cwd: REPO_PATH, env: execEnv, streamOutput: true });
@@ -280,6 +365,7 @@ async function main() {
   const branch = await resolveGitBranch();
   console.log(`Branch: ${branch}`);
   console.log(`URL:    ${PROD_URL}`);
+  console.log(`MAX_ITERATIONS:    ${MAX_ITERATIONS}`);
 
   for (let i = 1; i <= MAX_ITERATIONS; i++) {
     console.log("\n==============================");
