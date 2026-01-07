@@ -52,12 +52,82 @@ const VERCEL_TEAM_ID = process.env.VERCEL_TEAM_ID || "";
 const MAX_ITERATIONS = Number(process.env.MAX_ITERATIONS || 10);
 const SLEEP_AFTER_PUSH_SECONDS = Number(process.env.SLEEP_AFTER_PUSH_SECONDS || 90);
 const CODEX_USE_EXEC = (process.env.CODEX_USE_EXEC || "1") !== "0";
+const RUN_PREFLIGHT = process.env.RUN_PREFLIGHT === "1"; // opt-in local checks
+const PREFLIGHT_COMMANDS: string[][] = [
+  ["pnpm", "-C", "apps/web", "exec", "tsc", "--noEmit", "--pretty", "false"],
+  // Add lint/test commands if desired:
+  // ["pnpm", "-C", "apps/web", "lint"],
+  // ["pnpm", "-C", "apps/web", "test"],
+];
+const AUTOFIX_DIR = path.join(REPO_PATH, ".autofix");
+const STATE_PATH = path.join(AUTOFIX_DIR, "state.json");
+const RUN_MCP_PLAYWRIGHT = (process.env.RUN_MCP_PLAYWRIGHT || "1") !== "0";
+const MCP_PLAYWRIGHT_PLAN_PATH = path.resolve(
+  process.env.MCP_PLAYWRIGHT_PLAN || path.join(REPO_PATH, "playwright", "mcp-playwright-plan.json"),
+);
+const MCP_PLAYWRIGHT_RUNNER_PATH = path.resolve(
+  process.env.MCP_PLAYWRIGHT_RUNNER || path.join(REPO_PATH, "playwright", "mcp_playwright_runner.ts"),
+);
+const MCP_PLAYWRIGHT_LOG_PATH = path.join(AUTOFIX_DIR, "playwright_logs.md");
+const CODEX_RULES =
+  "- Edit files as needed, but do NOT commit.\n" +
+  "- Prefer minimal, targeted changes that address the specific issue.\n" +
+  "- Do not change dependency versions or lockfiles unless clearly required.\n" +
+  "- Prefer editing application code over root configs unless necessary.\n" +
+  "- Avoid broad refactors and keep diffs as small as possible.\n" +
+  "- Do NOT rely on local node_modules or locally built artifacts.\n" +
+  "- Refresh the lockfile only if there is clear evidence of a mismatch.";
+
+function extractInitialTaskFromArgv(): string {
+  const argv = process.argv || [];
+  let scriptIndex = -1;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (typeof arg !== "string") continue;
+    if (!arg.endsWith(".ts") && !arg.endsWith(".js")) continue;
+    const candidate = path.isAbsolute(arg) ? arg : path.resolve(process.cwd(), arg);
+    if (fs.existsSync(candidate)) scriptIndex = i;
+  }
+  const start = scriptIndex >= 0 ? scriptIndex + 1 : 2;
+  const fragments = argv.slice(start).filter((arg): arg is string => typeof arg === "string");
+  if (fragments.length === 0) return "";
+  const hasMeaningful = fragments.some((frag) => frag.trim().length > 0);
+  if (!hasMeaningful) return "";
+  const joined = fragments.join(" ").trim();
+  if (!joined) return "";
+  if (joined === '""' || joined === "''") return "";
+  return joined;
+}
+
+const INITIAL_TASK = extractInitialTaskFromArgv();
+
+function buildInitialCommitMessage(task: string): string {
+  const normalized = task.replace(/\s+/g, " ").trim();
+  if (!normalized) return "chore: codex initial task";
+  const prefix = "chore: codex initial task - ";
+  const maxLength = 72;
+  const available = Math.max(8, maxLength - prefix.length);
+  const snippet = normalized.length > available ? `${normalized.slice(0, available - 3)}...` : normalized;
+  return `${prefix}${snippet}`;
+}
 
 // =========================
 // HELPER FUNCTIONS
 // =========================
 
 type RunResult = { stdout: string; stderr: string; code: number };
+type AutoFixState = {
+  iteration: number;
+  lastPushedCommit?: string;
+  seenSignatures: string[];
+  resolvedSignatures: string[];
+  lastScore?: number;
+};
+type PlaywrightTestOutcome = {
+  ok: boolean;
+  logs: string;
+  logPath: string;
+};
 
 function run(
   cmd: string[],
@@ -94,11 +164,102 @@ function run(
   });
 }
 
+function ensureAutofixDir() {
+  if (!fs.existsSync(AUTOFIX_DIR)) fs.mkdirSync(AUTOFIX_DIR, { recursive: true });
+}
+
+function loadState(): AutoFixState {
+  ensureAutofixDir();
+  if (!fs.existsSync(STATE_PATH)) {
+    return { iteration: 0, seenSignatures: [], resolvedSignatures: [] };
+  }
+  try {
+    const raw = fs.readFileSync(STATE_PATH, "utf-8");
+    const parsed = JSON.parse(raw) as AutoFixState;
+    return {
+      iteration: parsed.iteration || 0,
+      lastPushedCommit: parsed.lastPushedCommit,
+      seenSignatures: parsed.seenSignatures || [],
+      resolvedSignatures: parsed.resolvedSignatures || [],
+      lastScore: parsed.lastScore,
+    };
+  } catch {
+    return { iteration: 0, seenSignatures: [], resolvedSignatures: [] };
+  }
+}
+
+function saveState(state: AutoFixState) {
+  ensureAutofixDir();
+  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2), "utf-8");
+}
+
 async function gitWorkdirHasChanges(): Promise<boolean> {
   const { code } = await run(["git", "diff", "--quiet"], { cwd: REPO_PATH });
   if (code !== 0) return true;
   const staged = await run(["git", "diff", "--cached", "--quiet"], { cwd: REPO_PATH });
   return staged.code !== 0;
+}
+
+async function getBranchAheadBehind(branch: string): Promise<{ ahead: number; behind: number } | null> {
+  const upstreamRef = `${branch}@{upstream}`;
+  const res = await run(["git", "rev-list", "--left-right", "--count", upstreamRef, branch], { cwd: REPO_PATH });
+  if (res.code !== 0) {
+    if (/no upstream configured/i.test(res.stderr)) {
+      console.warn(`[warn] Branch ${branch} has no upstream configured; skipping upstream push check.`);
+      return null;
+    }
+    console.warn(`[warn] Could not determine upstream status for branch ${branch}:\n${res.stderr || res.stdout}`);
+    return null;
+  }
+  const parts = res.stdout.trim().split(/\s+/);
+  if (parts.length < 2) return { ahead: 0, behind: 0 };
+  const behind = Number(parts[0] || 0) || 0;
+  const ahead = Number(parts[1] || 0) || 0;
+  return { ahead, behind };
+}
+
+function promptYesNo(question: string, defaultValue = false): Promise<boolean> {
+  if (!process.stdin.isTTY) {
+    console.warn("[warn] No interactive terminal detected; defaulting to 'no'.");
+    return Promise.resolve(defaultValue);
+  }
+  return new Promise((resolve) => {
+    process.stdout.write(question);
+    process.stdin.setEncoding("utf-8");
+    process.stdin.resume();
+    process.stdin.once("data", (data) => {
+      process.stdin.pause();
+      const answer = data.toString().trim().toLowerCase();
+      if (!answer) {
+        resolve(defaultValue);
+        return;
+      }
+      resolve(answer === "y" || answer === "yes");
+    });
+  });
+}
+
+async function maybePushAheadCommits(branch: string): Promise<boolean> {
+  const aheadBehind = await getBranchAheadBehind(branch);
+  if (!aheadBehind || aheadBehind.ahead <= 0) {
+    return true;
+  }
+
+  console.warn(`[warn] Local branch ${branch} is ahead of its upstream by ${aheadBehind.ahead} commit(s).`);
+  const confirm = await promptYesNo("Push these commits before starting the loop? [y/N] ");
+  if (!confirm) {
+    console.log("[info] Aborting to allow manual git push.");
+    return false;
+  }
+
+  const push = await run(["git", "push", GIT_REMOTE, branch], { cwd: REPO_PATH, streamOutput: true });
+  if (push.code !== 0) {
+    throw new Error(`git push failed:\n${push.stdout}\n${push.stderr}`);
+  }
+  console.log("[info] git push completed (pre-loop sync).");
+  console.log(`[info] Sleeping ${SLEEP_AFTER_PUSH_SECONDS}s while Vercel builds...`);
+  await sleep(SLEEP_AFTER_PUSH_SECONDS * 1000);
+  return true;
 }
 
 async function getCurrentCommitHash(short = true): Promise<string> {
@@ -136,6 +297,30 @@ function extractDeploymentCandidates(text: string): string[] {
 function stripAnsi(text: string): string {
   // ECMA-48 / ANSI escape sequences.
   return text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
+function extractErrorSignatures(logs: string): string[] {
+  const s = new Set<string>();
+  const lines = logs.split(/\r?\n/);
+
+  for (const line of lines) {
+    const m1 = line.match(/(?:^|\s)(\.\/[^\s]+?\.(?:ts|tsx|js|jsx)):(\d+):(\d+)/);
+    if (m1) s.add(`LOC|${m1[1]}:${m1[2]}:${m1[3]}`);
+    const m2 = line.match(/\bTS(\d{3,5})\b/);
+    if (m2) s.add(`TS${m2[1]}`);
+    if (/failed to compile/i.test(line)) s.add("NEXT_FAILED_TO_COMPILE");
+    if (/type error:/i.test(line)) s.add("TS_TYPE_ERROR");
+    if (/elifecycle/i.test(line)) s.add("PNPM_ELIFECYCLE");
+  }
+
+  return Array.from(s).slice(0, 30);
+}
+
+function scoreFromLogs(logs: string): number {
+  const lines = logs.split(/\r?\n/);
+  const tsErrCount = lines.filter((l) => /\bTS\d{3,5}\b/.test(l) || /type error:/i.test(l)).length;
+  const buildFail = /failed to compile|build failed|elifecycle|command failed with exit code|next\.js build worker exited/i.test(logs) ? 1 : 0;
+  return buildFail * 1000 + tsErrCount * 10;
 }
 
 function normalizeVercelInspectLogs(raw: string): string {
@@ -239,45 +424,27 @@ async function fetchLatestBuildLogs(): Promise<string> {
 
 function buildLooksSuccessful(logs: string): boolean {
   const text = logs.toLowerCase();
-  const failures = ["error ", "failed", "build failed", "exit code 1", "exited with 1"];
-  if (failures.some((f) => text.includes(f))) return false;
-  const success = ["deployment completed", "build completed", "ready! deployed to"];
-  return success.some((s) => text.includes(s));
+  const failMarkers = [
+    "failed to compile",
+    "type error:",
+    "build failed",
+    "elifecycle",
+    "command failed with exit code",
+    "next.js build worker exited with code",
+  ];
+  if (failMarkers.some((f) => text.includes(f))) return false;
+  const success = ["deployment completed", "ready! deployed to", "successfully deployed"];
+  if (success.some((s) => text.includes(s))) return true;
+  return false;
 }
 
-async function runCodexOnLogs(logs: string): Promise<boolean> {
-  console.log("\n[step] Running Codex with latest build logs...");
-  if (!logs.trim()) {
-    console.log("[info] No logs provided to Codex. Skipping.");
-    return false;
-  }
-
-  // Make logs available for the agent.
-  const logsPath = path.join(REPO_PATH, "dev_debug_logs.md");
-  fs.writeFileSync(
-    logsPath,
-    `# Vercel build logs\n\nFetched: ${new Date().toISOString()}\n\n\`\`\`\n${logs}\n\`\`\`\n`,
-    "utf-8",
-  );
-  console.log(`[info] Wrote logs to ${logsPath} for Codex context.`);
-
+async function runCodexPrompt(task: string): Promise<boolean> {
   const hadChangesBefore = await gitWorkdirHasChanges();
-
-  const task =
-    "You are Codex running in an autofix loop for a Vercel deployment.\n" +
-    "Goal: diagnose the build failure from the Vercel logs and modify the repo to fix it.\n" +
-    "Rules:\n" +
-    "- Edit files as needed, but do NOT commit.\n" +
-    "- Prefer minimal, targeted changes.\n" +
-    "- Do NOT rely on local node_modules or locally built artifacts; reason from the Vercel build logs and repo source.\n" +
-    "- If lockfile mismatches are indicated, refresh the lockfile accordingly.\n\n" +
-    `The logs are in ${logsPath}.\n` +
-    "Start by reading that file.";
 
   if (CODEX_USE_EXEC) {
     const execEnv = { ...process.env };
-    delete execEnv.OPENAI_API_KEY; // avoid forcing API-billed mode when CLI auth is available
-    delete execEnv.CODEX_API_KEY; // same: prefer the logged-in Codex CLI auth
+    delete execEnv.OPENAI_API_KEY;
+    delete execEnv.CODEX_API_KEY;
 
     const args = ["codex", "exec", "--full-auto", task];
     const res = await run(args, { cwd: REPO_PATH, env: execEnv, streamOutput: true });
@@ -325,12 +492,61 @@ async function runCodexOnLogs(logs: string): Promise<boolean> {
   return true;
 }
 
-async function gitCommitAndPush(branch: string): Promise<boolean> {
+async function runCodexOnLogs(logs: string, extraContext = ""): Promise<boolean> {
+  console.log("\n[step] Running Codex with latest build logs...");
+  if (!logs.trim()) {
+    console.log("[info] No logs provided to Codex. Skipping.");
+    return false;
+  }
+
+  // Make logs available for the agent.
+  const logsPath = path.join(REPO_PATH, "dev_debug_logs.md");
+  fs.writeFileSync(
+    logsPath,
+    `# Vercel build logs\n\nFetched: ${new Date().toISOString()}\n\n\`\`\`\n${logs}\n\`\`\`\n`,
+    "utf-8",
+  );
+  console.log(`[info] Wrote logs to ${logsPath} for Codex context.`);
+
+  const task =
+    "You are Codex running in an autofix loop for a Vercel deployment.\n" +
+    "Goal: diagnose the build failure from the Vercel logs and modify the repo to fix it.\n" +
+    "Rules:\n" +
+    `${CODEX_RULES}\n` +
+    "- Reason strictly from dev_debug_logs.md and the repo; do not assume hidden state.\n\n" +
+    `The logs are in ${logsPath}.\n` +
+    "Start by reading that file." +
+    (extraContext ? `\n\nAdditional context:\n${extraContext}` : "");
+
+  return runCodexPrompt(task);
+}
+
+async function runInitialCodexTask(initialTask: string, extraContext = ""): Promise<boolean> {
+  const trimmed = initialTask.trim();
+  if (!trimmed) {
+    console.log("[info] No initial task provided.");
+    return false;
+  }
+
+  console.log("\n[step] Running Codex for initial CLI task...");
+  const task =
+    "You are Codex running in an autofix loop for a Vercel deployment.\n" +
+    "Goal: implement the initial user request described below and ensure the code remains production-ready.\n" +
+    "Rules:\n" +
+    `${CODEX_RULES}\n` +
+    "- Avoid regressing existing functionality and prefer incremental changes.\n\n" +
+    `Initial task:\n${trimmed}\n` +
+    (extraContext ? `\nAdditional context:\n${extraContext}` : "");
+
+  return runCodexPrompt(task);
+}
+
+async function gitCommitAndPush(branch: string, customMessage?: string): Promise<boolean> {
   console.log("\n[step] Git add/commit/push...");
 
   await run(["git", "add", "-A"], { cwd: REPO_PATH });
 
-  const commitMsg = "chore: auto-fix by codex based on Vercel build logs";
+  const commitMsg = customMessage || "chore: auto-fix by codex based on Vercel build logs";
   const commit = await run(["git", "commit", "-m", commitMsg], { cwd: REPO_PATH });
   if (commit.code !== 0) {
     if (commit.stdout.toLowerCase().includes("nothing to commit") || commit.stderr.toLowerCase().includes("nothing to commit")) {
@@ -351,6 +567,65 @@ async function gitCommitAndPush(branch: string): Promise<boolean> {
   return true;
 }
 
+async function runPreflight(): Promise<{ ok: boolean; output: string }> {
+  if (!RUN_PREFLIGHT || PREFLIGHT_COMMANDS.length === 0) {
+    return { ok: true, output: "[info] Preflight disabled (RUN_PREFLIGHT!=1 or no commands)." };
+  }
+  console.log("\n[step] Running local preflight checks...");
+  let output = "";
+  for (const cmd of PREFLIGHT_COMMANDS) {
+    console.log(`[preflight] ${cmd.join(" ")}`);
+    const res = await run(cmd, { cwd: REPO_PATH, streamOutput: true });
+    const combined = `${res.stdout}\n${res.stderr}`.trim();
+    output += `\n\n## ${cmd.join(" ")}\n\n${combined}\n`;
+    if (res.code !== 0) {
+      return { ok: false, output };
+    }
+  }
+  return { ok: true, output };
+}
+
+async function runMcpPlaywrightTests(): Promise<PlaywrightTestOutcome | null> {
+  if (!RUN_MCP_PLAYWRIGHT) {
+    console.log("[info] RUN_MCP_PLAYWRIGHT=0 — skipping MCP Playwright tests.");
+    return null;
+  }
+  if (!fs.existsSync(MCP_PLAYWRIGHT_RUNNER_PATH)) {
+    console.log(`[info] Playwright runner not found at ${MCP_PLAYWRIGHT_RUNNER_PATH}. Skipping tests.`);
+    return null;
+  }
+  if (!fs.existsSync(MCP_PLAYWRIGHT_PLAN_PATH)) {
+    console.log(`[info] Playwright plan not found at ${MCP_PLAYWRIGHT_PLAN_PATH}. Skipping tests.`);
+    return null;
+  }
+
+  console.log("\n[step] Running MCP Playwright smoke tests...");
+  const env = { ...process.env };
+  env.MCP_PLAYWRIGHT_PLAN = MCP_PLAYWRIGHT_PLAN_PATH;
+  if (!env.MCP_PLAYWRIGHT_BASE_URL && PROD_URL) {
+    env.MCP_PLAYWRIGHT_BASE_URL = PROD_URL;
+  }
+
+  const args = ["npx", "ts-node", MCP_PLAYWRIGHT_RUNNER_PATH, "--plan", MCP_PLAYWRIGHT_PLAN_PATH];
+  const res = await run(args, { cwd: REPO_PATH, env, streamOutput: true });
+  const combined = `${res.stdout}\n${res.stderr}`.trim();
+
+  ensureAutofixDir();
+  fs.writeFileSync(
+    MCP_PLAYWRIGHT_LOG_PATH,
+    `# MCP Playwright logs\n\nRun: ${new Date().toISOString()}\nPlan: ${MCP_PLAYWRIGHT_PLAN_PATH}\nRunner: ${MCP_PLAYWRIGHT_RUNNER_PATH}\nBase URL: ${
+      env.MCP_PLAYWRIGHT_BASE_URL || "n/a"
+    }\n\n\`\`\`\n${combined}\n\`\`\`\n`,
+    "utf-8",
+  );
+
+  return {
+    ok: res.code === 0,
+    logs: combined || "[no logs produced by Playwright]",
+    logPath: MCP_PLAYWRIGHT_LOG_PATH,
+  };
+}
+
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -367,6 +642,56 @@ async function main() {
   console.log(`URL:    ${PROD_URL}`);
   console.log(`MAX_ITERATIONS:    ${MAX_ITERATIONS}`);
 
+  const synced = await maybePushAheadCommits(branch);
+  if (!synced) {
+    console.log("[stop] Exiting before Codex loop because local commits were not pushed.");
+    return;
+  }
+
+  let state = loadState();
+
+  if (INITIAL_TASK) {
+    console.log("\n[init] Initial CLI task detected:");
+    console.log(`       ${INITIAL_TASK}`);
+    const initialChanged = await runInitialCodexTask(INITIAL_TASK);
+    if (!initialChanged) {
+      console.log("[info] Initial task produced no repo changes. Continuing to build-log loop.");
+    } else {
+      const preflight = await runPreflight();
+      if (RUN_PREFLIGHT && !preflight.ok) {
+        console.log("[warn] Preflight failed after initial task; asking Codex to revise the patch.");
+        const constraints =
+          "\nAdditional constraints:\n" +
+          "- Complete the initial CLI request without breaking preflight commands.\n" +
+          "- Keep prior fixes intact unless absolutely necessary.\n" +
+          "\nPreflight output:\n```text\n" +
+          preflight.output.slice(-12000) +
+          "\n```\n";
+
+        const retryChanged = await runInitialCodexTask(INITIAL_TASK, constraints);
+        if (!retryChanged) {
+          console.log("[info] Codex could not resolve the initial task preflight issues. Stopping.");
+          return;
+        }
+
+        const preflightRetry = await runPreflight();
+        if (!preflightRetry.ok) {
+          console.log("[warn] Preflight still failing after retry. Stopping to avoid regressions.");
+          return;
+        }
+      }
+
+      const commitMsg = buildInitialCommitMessage(INITIAL_TASK);
+      const pushed = await gitCommitAndPush(branch, commitMsg);
+      if (!pushed) {
+        console.log("[info] Initial task yielded nothing to push. Continuing to build-log loop.");
+      } else {
+        console.log(`[info] Sleeping ${SLEEP_AFTER_PUSH_SECONDS}s while Vercel builds...`);
+        await sleep(SLEEP_AFTER_PUSH_SECONDS * 1000);
+      }
+    }
+  }
+
   for (let i = 1; i <= MAX_ITERATIONS; i++) {
     console.log("\n==============================");
     console.log(`Iteration ${i}/${MAX_ITERATIONS}`);
@@ -379,16 +704,94 @@ async function main() {
       continue;
     }
 
-    if (buildLooksSuccessful(logs)) {
+    let effectiveLogs = logs;
+    let extraCodexContext = "";
+    let logSource: "vercel" | "playwright" = "vercel";
+    let finalSuccess = false;
+    let playwrightOutcome: PlaywrightTestOutcome | null = null;
+    const deployLooksSuccessful = buildLooksSuccessful(logs);
+
+    if (deployLooksSuccessful) {
+      playwrightOutcome = await runMcpPlaywrightTests();
+      if (!playwrightOutcome || playwrightOutcome.ok) {
+        finalSuccess = true;
+      } else {
+        console.warn("[warn] MCP Playwright smoke tests failed after a successful deployment.");
+        effectiveLogs = playwrightOutcome.logs;
+        logSource = "playwright";
+        extraCodexContext =
+          "Playwright smoke tests failed after a successful deployment.\n" +
+          `Logs saved to ${playwrightOutcome.logPath}.\n` +
+          "Update the application and Playwright plan so these tests pass consistently.";
+      }
+    }
+
+    const rawSigs = extractErrorSignatures(effectiveLogs);
+    const sigSet = new Set(rawSigs);
+    if (logSource === "playwright") {
+      sigSet.add("PLAYWRIGHT_TEST_FAILURE");
+    }
+    const sigs = Array.from(sigSet);
+    let score = scoreFromLogs(effectiveLogs);
+    if (logSource === "playwright") {
+      score += 5000;
+    }
+    console.log(`[info] Score=${score}, signatures=${sigs.join(", ")}`);
+    const regression = sigs.some((x) => state.resolvedSignatures.includes(x));
+    if (regression) {
+      console.warn("[warn] Regression detected: previously resolved signature reappeared.");
+    }
+
+    state.iteration = state.iteration + 1;
+    state.seenSignatures = Array.from(new Set([...state.seenSignatures, ...sigs])).slice(-200);
+    state.lastScore = score;
+    saveState(state);
+
+    if (finalSuccess) {
       console.log("[info] Build looks successful 🎉");
+      if (playwrightOutcome) {
+        console.log("[info] MCP Playwright smoke tests also passed ✅");
+      } else if (RUN_MCP_PLAYWRIGHT) {
+        console.log("[info] MCP Playwright tests skipped (plan or runner not found).");
+      } else {
+        console.log("[info] MCP Playwright tests disabled (RUN_MCP_PLAYWRIGHT=0).");
+      }
+      state = loadState();
+      state.resolvedSignatures = Array.from(new Set([...state.resolvedSignatures, ...state.seenSignatures])).slice(-200);
+      saveState(state);
       console.log("[done] Stopping loop.");
       return;
     }
 
-    const changed = await runCodexOnLogs(logs);
+    const changed = await runCodexOnLogs(effectiveLogs, extraCodexContext);
     if (!changed) {
       console.log("[info] Codex has no further changes. Stopping loop.");
       return;
+    }
+
+    const preflight = await runPreflight();
+    if (RUN_PREFLIGHT && !preflight.ok) {
+      console.log("[warn] Preflight failed; asking Codex to fix without regressions.");
+      const constraints =
+        "\nAdditional constraints:\n" +
+        `- Do NOT reintroduce previously seen error signatures: ${state.resolvedSignatures.join(", ") || "none"}\n` +
+        "- Do NOT revert previous fixes unless absolutely necessary.\n" +
+        "- After changes, ensure `pnpm -C apps/web exec tsc --noEmit --pretty false` passes.\n" +
+        "\nPreflight output:\n```text\n" +
+        preflight.output.slice(-12000) +
+        "\n```\n";
+
+      const retryChanged = await runCodexOnLogs(effectiveLogs, constraints);
+      if (!retryChanged) {
+        console.log("[info] Codex could not fix preflight. Stopping.");
+        return;
+      }
+
+      const preflightRetry = await runPreflight();
+      if (!preflightRetry.ok) {
+        console.log("[warn] Preflight still failing after retry. Stopping to avoid regressions.");
+        return;
+      }
     }
 
     const pushed = await gitCommitAndPush(branch);

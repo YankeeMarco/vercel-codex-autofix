@@ -1,0 +1,36 @@
+{
+  "defaultBaseUrl": "https://example.com",
+  "notes": "Edit selectors/paths to match your application. Actions map directly to Playwright commands handled by mcp_playwright_runner.ts.",
+  "scenarios": [
+    {
+      "name": "Marketing contact form submit",
+      "goal": "Ensure a visitor can reach the contact page and submit the lead form.",
+      "path": "/contact",
+      "actions": [
+        { "type": "goto", "path": "/contact" },
+        { "type": "waitForSelector", "selector": "[data-test=\"contact-form\"]" },
+        { "type": "fill", "selector": "input[name=\"fullName\"]", "value": "Autofix McP" },
+        { "type": "fill", "selector": "input[name=\"email\"]", "value": "autofix+{{RANDOM}}@example.com" },
+        { "type": "fill", "selector": "textarea[name=\"message\"]", "value": "Smoke test contact form via MCP Playwright." },
+        { "type": "click", "selector": "[data-test=\"contact-submit\"]" },
+        { "type": "expectText", "selector": "[data-test=\"contact-success\"]", "text": "Thanks", "match": "includes" }
+      ]
+    },
+    {
+      "name": "Dashboard avatar upload",
+      "goal": "Ensure authenticated users can upload a profile image.",
+      "path": "/dashboard/profile",
+      "actions": [
+        { "type": "goto", "path": "/login" },
+        { "type": "waitForSelector", "selector": "[data-test=\"login-form\"]" },
+        { "type": "fill", "selector": "input[name=\"email\"]", "value": "user@example.com" },
+        { "type": "fill", "selector": "input[name=\"password\"]", "value": "Password123!" },
+        { "type": "click", "selector": "[data-test=\"login-submit\"]" },
+        { "type": "waitForSelector", "selector": "[data-test=\"profile-page\"]" },
+        { "type": "upload", "selector": "input[type=\"file\"][name=\"avatar\"]", "file": "playwright/fixtures/avatar.png" },
+        { "type": "click", "selector": "[data-test=\"profile-save\"]" },
+        { "type": "expectText", "selector": "[data-test=\"toast\"]", "text": "Profile updated", "match": "includes" }
+      ]
+    }
+  ]
+}

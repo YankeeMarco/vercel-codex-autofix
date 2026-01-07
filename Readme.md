@@ -109,6 +109,13 @@ CODEX_USE_EXEC=1   # use Codex CLI (recommended)
 # --- Loop Control ---
 MAX_ITERATIONS=10
 SLEEP_AFTER_PUSH_SECONDS=90
+RUN_PREFLIGHT=0  # set to 1 to run local checks (tsc/lint/tests) before committing
+
+# --- MCP Playwright smoke tests ---
+RUN_MCP_PLAYWRIGHT=1
+MCP_PLAYWRIGHT_PLAN=playwright/mcp-playwright-plan.json
+MCP_PLAYWRIGHT_BASE_URL=        # defaults to PROD_URL if empty
+MCP_PLAYWRIGHT_RUNNER=playwright/mcp_playwright_runner.ts
 ```
 
 Note:
@@ -137,6 +144,27 @@ What this does
 
 You do not need to pass --ref or specify a branch manually.
 
+Optional: kick off an initial task before the build-log loop
+	•	Append any free-form instruction after the script path; e.g.:
+
+```
+CODEX_USE_EXEC=1 npx ts-node ~/Documents/vercel-codex-autofix/vercel_codex_loop.ts "add facebook auth"
+```
+
+	•	The quoted text is handed to Codex before the usual Vercel log iterations, ideal for “please build X feature” tasks.
+	•	Passing an empty string (e.g., `""`, `''`, or whitespace) explicitly skips the initial-task phase if you want log-based repair only.
+
+Optional: trigger the MCP Playwright smoke tests manually
+	•	Run the deterministic runner directly (uses the same artifacts as the loop):
+
+```
+MCP_PLAYWRIGHT_BASE_URL=https://your-app.vercel.app \
+npx ts-node ~/Documents/vercel-codex-autofix/playwright/mcp_playwright_runner.ts --plan playwright/mcp-playwright-plan.json
+```
+
+	•	Update `playwright/mcp-playwright-plan.json` and `playwright/testing_nlp_instructions.md` to describe the flows (login, forms, uploads, etc.).
+	•	The loop automatically executes the same command after each successful deployment and feeds any failures back into Codex.
+
 ⸻
 
 🔄 What happens when you run it
@@ -155,6 +183,7 @@ vercel inspect <deployment> --logs --wait
 	•	git commit
 	•	git push origin <active-branch>
 	8.	Waits and repeats
+	9.	When Vercel declares the deployment successful, runs the MCP Playwright smoke tests (if configured); failures feed fresh logs back into Codex, passing runs stop the loop
 
 ⸻
 
@@ -177,6 +206,16 @@ Iteration 1/10
 
 ⸻
 
+🧪 MCP Playwright smoke tests
+	•	After Vercel reports a successful build, the loop executes `playwright/mcp_playwright_runner.ts` with the plan defined in `playwright/mcp-playwright-plan.json`.
+	•	The high-level, natural-language intent for each scenario lives in `playwright/testing_nlp_instructions.md`; keep it updated so teammates (or MCP tools) know what should happen.
+	•	The runner is deterministic and does not call an LLM — it relies entirely on the JSON plan (routes, selectors, clicks, form fills, uploads, and assertions).
+	•	Logs are saved to `.autofix/playwright_logs.md`. When a scenario fails, that file is passed to Codex so it can patch the repo based on test output instead of deployment logs.
+	•	Set `RUN_MCP_PLAYWRIGHT=0` to disable this stage, or customize the plan/runner paths via `MCP_PLAYWRIGHT_PLAN` and `MCP_PLAYWRIGHT_RUNNER`.
+	•	Run `npx playwright install chromium` once (after `npm install`) so the headless browser binary is present on the machine executing the loop.
+
+⸻
+
 🛑 Stop conditions (safety)
 
 The loop stops when any is true:
@@ -195,6 +234,14 @@ No infinite loops.
 	•	Add multiple Codex passes
 	•	Add structured error classification
 	•	Integrate with GitHub Actions
+
+🧯 Stability tips (avoid A↔B oscillation)
+	•	Add regression bundles: store error signature + repro command for each fix; rerun the last N repros on every patch.
+	•	Canonicalize logs into signatures (tool/code/file/line/normalized message) and treat repeats as regressions.
+	•	Enforce monotonic progress with a score (e.g., 1000*build failures + 50*ts errors + 10*lint + test fails) — reject non-improving patches.
+	•	Freeze high-risk files (lockfiles, tsconfig, root configs) unless explicitly required and justified.
+	•	Keep decision records (why we picked a fix and rejected alternatives) and feed them to the agent to prevent reverts.
+	•	Use propose→critic passes: one agent patches, another verifies regressions/forbidden files before accepting.
 
 ⛑️ Troubleshooting
 	•	Codex CLI error `invalid_encrypted_content`: clear stale credentials and re-login with ChatGPT auth:
