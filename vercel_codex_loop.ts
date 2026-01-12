@@ -61,14 +61,10 @@ const PREFLIGHT_COMMANDS: string[][] = [
 ];
 const AUTOFIX_DIR = path.join(REPO_PATH, ".autofix");
 const STATE_PATH = path.join(AUTOFIX_DIR, "state.json");
-const RUN_MCP_PLAYWRIGHT = (process.env.RUN_MCP_PLAYWRIGHT || "1") !== "0";
-const MCP_PLAYWRIGHT_PLAN_PATH = path.resolve(
-  process.env.MCP_PLAYWRIGHT_PLAN || path.join(REPO_PATH, "playwright", "mcp-playwright-plan.json"),
-);
-const MCP_PLAYWRIGHT_RUNNER_PATH = path.resolve(
-  process.env.MCP_PLAYWRIGHT_RUNNER || path.join(REPO_PATH, "playwright", "mcp_playwright_runner.ts"),
-);
-const MCP_PLAYWRIGHT_LOG_PATH = path.join(AUTOFIX_DIR, "playwright_logs.md");
+const RUN_MCP_GUI = (process.env.RUN_MCP_GUI || process.env.RUN_MCP_PLAYWRIGHT || "1") !== "0";
+const MCP_GUI_SCRIPT_PATH = path.resolve(process.env.MCP_GUI_SCRIPT || path.join(REPO_PATH, "mcp", "run-gui-check.sh"));
+const MCP_GUI_OUTPUT_DIR = path.resolve(process.env.MCP_GUI_LOG_DIR || path.join(REPO_PATH, "logs", "gui"));
+const MCP_GUI_REPORT_PATH = path.join(AUTOFIX_DIR, "gui_report.md");
 const CODEX_RULES =
   "- Edit files as needed, but do NOT commit.\n" +
   "- Prefer minimal, targeted changes that address the specific issue.\n" +
@@ -123,10 +119,11 @@ type AutoFixState = {
   resolvedSignatures: string[];
   lastScore?: number;
 };
-type PlaywrightTestOutcome = {
+type GuiCheckOutcome = {
   ok: boolean;
-  logs: string;
+  report: string;
   logPath: string;
+  targetUrl: string;
 };
 
 function run(
@@ -394,7 +391,7 @@ async function getDeploymentIdForCurrentCommit(): Promise<string | null> {
   return null;
 }
 
-async function fetchLatestBuildLogs(): Promise<string> {
+async function fetchLatestBuildLogs(): Promise<{ logs: string; deploymentUrl?: string }> {
   console.log("\n[step] Fetching Vercel build logs for current commit...");
   const env = { ...process.env };
   if (VERCEL_TOKEN) env.VERCEL_AUTH_TOKEN = VERCEL_TOKEN;
@@ -403,9 +400,8 @@ async function fetchLatestBuildLogs(): Promise<string> {
   const dep = await getDeploymentIdForCurrentCommit();
   if (!dep) {
     console.warn("[warn] Could not find a deployment for the current commit.");
-    return "";
+    return { logs: "", deploymentUrl: undefined };
   }
-
   console.log(`[info] Inspecting deployment ${dep} ...`);
   const timeout = process.env.VERCEL_INSPECT_TIMEOUT || "10m";
   const res = await run(["vercel", "inspect", dep, "--logs", "--wait", "--timeout", timeout, "--no-color"], { cwd: REPO_PATH, env });
@@ -413,13 +409,13 @@ async function fetchLatestBuildLogs(): Promise<string> {
   const logs = normalizeVercelInspectLogs(rawLogs) || rawLogs;
   if (!logs.trim()) {
     console.warn("[warn] No logs returned from Vercel for this deployment.");
-    return "";
+    return { logs: "", deploymentUrl: dep || undefined };
   }
 
   const lines = logs.split(/\r?\n/);
   console.log("[info] Log snippet:");
   console.log(lines.slice(-25).join("\n"));
-  return logs;
+  return { logs, deploymentUrl: dep || undefined };
 }
 
 function buildLooksSuccessful(logs: string): boolean {
@@ -586,43 +582,48 @@ async function runPreflight(): Promise<{ ok: boolean; output: string }> {
 }
 
 async function runMcpPlaywrightTests(): Promise<PlaywrightTestOutcome | null> {
-  if (!RUN_MCP_PLAYWRIGHT) {
-    console.log("[info] RUN_MCP_PLAYWRIGHT=0 — skipping MCP Playwright tests.");
-    return null;
-  }
-  if (!fs.existsSync(MCP_PLAYWRIGHT_RUNNER_PATH)) {
-    console.log(`[info] Playwright runner not found at ${MCP_PLAYWRIGHT_RUNNER_PATH}. Skipping tests.`);
-    return null;
-  }
-  if (!fs.existsSync(MCP_PLAYWRIGHT_PLAN_PATH)) {
-    console.log(`[info] Playwright plan not found at ${MCP_PLAYWRIGHT_PLAN_PATH}. Skipping tests.`);
+async function runGuiCheck(targetUrl?: string): Promise<GuiCheckOutcome | null> {
+  if (!RUN_MCP_GUI) {
+    console.log("[info] RUN_MCP_GUI=0 — skipping GUI checks.");
     return null;
   }
 
-  console.log("\n[step] Running MCP Playwright smoke tests...");
+  const resolvedTarget = targetUrl || PROD_URL;
+  if (!resolvedTarget) {
+    console.log("[info] No target URL available for GUI checks. Set PROD_URL or pass MCP_GUI_TARGET_URL.");
+    return null;
+  }
+
+  if (!fs.existsSync(MCP_GUI_SCRIPT_PATH)) {
+    console.log(`[info] GUI runner script not found at ${MCP_GUI_SCRIPT_PATH}. Skipping GUI checks.`);
+    return null;
+  }
+
+  console.log("\n[step] Running MCP Playwright GUI checks...");
   const env = { ...process.env };
-  env.MCP_PLAYWRIGHT_PLAN = MCP_PLAYWRIGHT_PLAN_PATH;
-  if (!env.MCP_PLAYWRIGHT_BASE_URL && PROD_URL) {
-    env.MCP_PLAYWRIGHT_BASE_URL = PROD_URL;
-  }
+  env.MCP_GUI_TARGET_URL = resolvedTarget;
+  env.MCP_GUI_LOG_DIR = MCP_GUI_OUTPUT_DIR;
 
-  const args = ["npx", "ts-node", MCP_PLAYWRIGHT_RUNNER_PATH, "--plan", MCP_PLAYWRIGHT_PLAN_PATH];
-  const res = await run(args, { cwd: REPO_PATH, env, streamOutput: true });
+  const res = await run(["bash", MCP_GUI_SCRIPT_PATH, resolvedTarget], {
+    cwd: REPO_PATH,
+    env,
+    streamOutput: true,
+  });
   const combined = `${res.stdout}\n${res.stderr}`.trim();
 
   ensureAutofixDir();
   fs.writeFileSync(
-    MCP_PLAYWRIGHT_LOG_PATH,
-    `# MCP Playwright logs\n\nRun: ${new Date().toISOString()}\nPlan: ${MCP_PLAYWRIGHT_PLAN_PATH}\nRunner: ${MCP_PLAYWRIGHT_RUNNER_PATH}\nBase URL: ${
-      env.MCP_PLAYWRIGHT_BASE_URL || "n/a"
-    }\n\n\`\`\`\n${combined}\n\`\`\`\n`,
+    MCP_GUI_REPORT_PATH,
+    `# MCP Playwright GUI report\n\nRun: ${new Date().toISOString()}\nTarget: ${resolvedTarget}\nLogs directory: ${MCP_GUI_OUTPUT_DIR}\n\n\`\`\`\n${combined}\n\`\`\`\n`,
     "utf-8",
   );
 
+  const ok = res.code === 0 && !/FAIL/i.test(combined);
   return {
-    ok: res.code === 0,
-    logs: combined || "[no logs produced by Playwright]",
-    logPath: MCP_PLAYWRIGHT_LOG_PATH,
+    ok,
+    report: combined || "[no report produced]",
+    logPath: MCP_GUI_REPORT_PATH,
+    targetUrl: resolvedTarget,
   };
 }
 
@@ -697,7 +698,7 @@ async function main() {
     console.log(`Iteration ${i}/${MAX_ITERATIONS}`);
     console.log("==============================");
 
-    const logs = await fetchLatestBuildLogs();
+    const { logs, deploymentUrl } = await fetchLatestBuildLogs();
     if (!logs.trim()) {
       console.log("[warn] No logs found. Sleeping and retrying...");
       await sleep(SLEEP_AFTER_PUSH_SECONDS * 1000);
@@ -706,34 +707,36 @@ async function main() {
 
     let effectiveLogs = logs;
     let extraCodexContext = "";
-    let logSource: "vercel" | "playwright" = "vercel";
+    let logSource: "vercel" | "gui" = "vercel";
     let finalSuccess = false;
-    let playwrightOutcome: PlaywrightTestOutcome | null = null;
+    let guiOutcome: GuiCheckOutcome | null = null;
     const deployLooksSuccessful = buildLooksSuccessful(logs);
 
     if (deployLooksSuccessful) {
-      playwrightOutcome = await runMcpPlaywrightTests();
-      if (!playwrightOutcome || playwrightOutcome.ok) {
+      guiOutcome = await runGuiCheck(deploymentUrl || PROD_URL);
+      if (!guiOutcome || guiOutcome.ok) {
         finalSuccess = true;
       } else {
-        console.warn("[warn] MCP Playwright smoke tests failed after a successful deployment.");
-        effectiveLogs = playwrightOutcome.logs;
-        logSource = "playwright";
+        console.warn("[warn] GUI checks failed after a successful deployment.");
+        effectiveLogs = guiOutcome.report;
+        logSource = "gui";
         extraCodexContext =
-          "Playwright smoke tests failed after a successful deployment.\n" +
-          `Logs saved to ${playwrightOutcome.logPath}.\n` +
-          "Update the application and Playwright plan so these tests pass consistently.";
+          "GUI regression detected by MCP Playwright after deployment.\n" +
+          `Target URL: ${guiOutcome.targetUrl}\n` +
+          `GUI report saved to ${guiOutcome.logPath}\n` +
+          `Artifacts directory: ${MCP_GUI_OUTPUT_DIR}\n` +
+          "Analyze the report, inspect the trace/video in the logs directory, and patch the application so the scenario passes.";
       }
     }
 
     const rawSigs = extractErrorSignatures(effectiveLogs);
     const sigSet = new Set(rawSigs);
-    if (logSource === "playwright") {
-      sigSet.add("PLAYWRIGHT_TEST_FAILURE");
+    if (logSource === "gui") {
+      sigSet.add("GUI_REGRESSION");
     }
     const sigs = Array.from(sigSet);
     let score = scoreFromLogs(effectiveLogs);
-    if (logSource === "playwright") {
+    if (logSource === "gui") {
       score += 5000;
     }
     console.log(`[info] Score=${score}, signatures=${sigs.join(", ")}`);
@@ -749,12 +752,12 @@ async function main() {
 
     if (finalSuccess) {
       console.log("[info] Build looks successful 🎉");
-      if (playwrightOutcome) {
-        console.log("[info] MCP Playwright smoke tests also passed ✅");
-      } else if (RUN_MCP_PLAYWRIGHT) {
-        console.log("[info] MCP Playwright tests skipped (plan or runner not found).");
+      if (guiOutcome) {
+        console.log("[info] MCP Playwright GUI checks also passed ✅");
+      } else if (RUN_MCP_GUI) {
+        console.log("[info] GUI checks skipped (script missing or target URL unavailable).");
       } else {
-        console.log("[info] MCP Playwright tests disabled (RUN_MCP_PLAYWRIGHT=0).");
+        console.log("[info] GUI checks disabled (RUN_MCP_GUI=0).");
       }
       state = loadState();
       state.resolvedSignatures = Array.from(new Set([...state.resolvedSignatures, ...state.seenSignatures])).slice(-200);

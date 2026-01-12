@@ -1,0 +1,18 @@
+{
+  "browser": {
+    "browserName": "chromium",
+    "launchOptions": {
+      "headless": true
+    },
+    "contextOptions": {
+      "viewport": {
+        "width": 1280,
+        "height": 720
+      }
+    }
+  },
+  "timeouts": {
+    "action": 10000,
+    "navigation": 60000
+  }
+}

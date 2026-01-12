@@ -49,3 +49,7 @@ dist/
 .vercel
 
 .pnpm-store/
+
+# gui logs
+logs/*
+!logs/.gitkeep

@@ -111,11 +111,10 @@ MAX_ITERATIONS=10
 SLEEP_AFTER_PUSH_SECONDS=90
 RUN_PREFLIGHT=0  # set to 1 to run local checks (tsc/lint/tests) before committing
 
-# --- MCP Playwright smoke tests ---
-RUN_MCP_PLAYWRIGHT=1
-MCP_PLAYWRIGHT_PLAN=playwright/mcp-playwright-plan.json
-MCP_PLAYWRIGHT_BASE_URL=        # defaults to PROD_URL if empty
-MCP_PLAYWRIGHT_RUNNER=playwright/mcp_playwright_runner.ts
+# --- MCP Playwright GUI checks ---
+RUN_MCP_GUI=1
+MCP_GUI_SCRIPT=mcp/run-gui-check.sh
+MCP_GUI_LOG_DIR=logs/gui
 ```
 
 Note:
@@ -154,16 +153,15 @@ CODEX_USE_EXEC=1 npx ts-node ~/Documents/vercel-codex-autofix/vercel_codex_loop.
 	•	The quoted text is handed to Codex before the usual Vercel log iterations, ideal for “please build X feature” tasks.
 	•	Passing an empty string (e.g., `""`, `''`, or whitespace) explicitly skips the initial-task phase if you want log-based repair only.
 
-Optional: trigger the MCP Playwright smoke tests manually
-	•	Run the deterministic runner directly (uses the same artifacts as the loop):
+Optional: trigger the MCP Playwright GUI scout manually
+	•	Run the helper script, which shells out to `npx @playwright/mcp` with the intent spec in `mcp/gui-tests.md`:
 
 ```
-MCP_PLAYWRIGHT_BASE_URL=https://your-app.vercel.app \
-npx ts-node ~/Documents/vercel-codex-autofix/playwright/mcp_playwright_runner.ts --plan playwright/mcp-playwright-plan.json
+bash mcp/run-gui-check.sh https://your-app.vercel.app
 ```
 
-	•	Update `playwright/mcp-playwright-plan.json` and `playwright/testing_nlp_instructions.md` to describe the flows (login, forms, uploads, etc.).
-	•	The loop automatically executes the same command after each successful deployment and feeds any failures back into Codex.
+	•	Artifacts (trace/video/report) land in `logs/gui/` and `.autofix/gui_report.md`.
+	•	The loop automatically runs the same script after each successful deployment and feeds any FAIL sections straight into Codex.
 
 ⸻
 
@@ -183,7 +181,7 @@ vercel inspect <deployment> --logs --wait
 	•	git commit
 	•	git push origin <active-branch>
 	8.	Waits and repeats
-	9.	When Vercel declares the deployment successful, runs the MCP Playwright smoke tests (if configured); failures feed fresh logs back into Codex, passing runs stop the loop
+	9.	When Vercel declares the deployment successful, runs `mcp/run-gui-check.sh` (if enabled); GUI failures feed fresh logs back into Codex, passing runs stop the loop
 
 ⸻
 
@@ -206,13 +204,13 @@ Iteration 1/10
 
 ⸻
 
-🧪 MCP Playwright smoke tests
-	•	After Vercel reports a successful build, the loop executes `playwright/mcp_playwright_runner.ts` with the plan defined in `playwright/mcp-playwright-plan.json`.
-	•	The high-level, natural-language intent for each scenario lives in `playwright/testing_nlp_instructions.md`; keep it updated so teammates (or MCP tools) know what should happen.
-	•	The runner is deterministic and does not call an LLM — it relies entirely on the JSON plan (routes, selectors, clicks, form fills, uploads, and assertions).
-	•	Logs are saved to `.autofix/playwright_logs.md`. When a scenario fails, that file is passed to Codex so it can patch the repo based on test output instead of deployment logs.
-	•	Set `RUN_MCP_PLAYWRIGHT=0` to disable this stage, or customize the plan/runner paths via `MCP_PLAYWRIGHT_PLAN` and `MCP_PLAYWRIGHT_RUNNER`.
-	•	Run `npx playwright install chromium` once (after `npm install`) so the headless browser binary is present on the machine executing the loop.
+🧪 MCP Playwright GUI scout
+	•	After Vercel reports a successful build, the loop executes `mcp/run-gui-check.sh`, which shells out to `npx @playwright/mcp` with the instructions defined in `mcp/gui-tests.md`.
+	•	The script uses the config in `mcp/playwright.config.json` (headless Chromium, deterministic viewport) and stores traces/videos under `logs/gui/`.
+	•	The natural-language intent file is what Codex/MCP agents read; you don’t write Playwright test code—only intent.
+	•	The helper writes a summarized PASS/FAIL report to `.autofix/gui_report.md`; when it contains “FAIL”, that file becomes Codex’s new log source for the next autofix turn.
+	•	Set `RUN_MCP_GUI=0` to disable this stage, or override `MCP_GUI_SCRIPT` / `MCP_GUI_LOG_DIR` if you relocate the script.
+	•	Run the script manually at any time via `bash mcp/run-gui-check.sh https://your-app.vercel.app` to reproduce GUI regressions locally.
 
 ⸻
 
