@@ -1,0 +1,9 @@
+# syntax=docker/dockerfile:1
+FROM node:24.10.0-alpine
+
+RUN apk add --no-cache bash libc6-compat git openssh
+WORKDIR /workspace
+RUN corepack enable && corepack prepare pnpm@latest --activate
+ENV NODE_ENV=development NEXT_TELEMETRY_DISABLED=1 HOSTNAME=0.0.0.0 PORT=3000 PNPM_HOME=/root/.local/share/pnpm PNPM_STORE_PATH=/pnpm-store
+EXPOSE 3000
+CMD ["sh"]

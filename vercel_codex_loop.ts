@@ -2,9 +2,9 @@ import { spawn } from "child_process";
 import fs from "fs";
 import path from "path";
 import process from "process";
-import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 import { Codex } from "@openai/codex-sdk";
+import { fileURLToPath } from "url";
 
 function loadEnv() {
   const explicit = process.env.DOTENV_CONFIG_PATH;

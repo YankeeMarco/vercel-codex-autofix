@@ -1,48 +1,46 @@
- 📦 vercel-codex-autofix
+# 📦 vercel-codex-autofix
 
 An autonomous self-healing deployment loop for Vercel projects.
 
-vercel-codex-autofix continuously watches the exact Vercel build corresponding to your current Git commit, diagnoses failures from build logs, applies fixes using Codex, commits the patch, and redeploys — automatically.
+`vercel-codex-autofix` continuously watches the exact Vercel build corresponding to your current Git commit, diagnoses failures from build logs, applies fixes using Codex, commits the patch, and redeploys — automatically.
 
-No dashboards.
-No manual log hunting.
+No dashboards.  
+No manual log hunting.  
 No refspec confusion.
 
 ⸻
 
-✨ What this project does (in plain terms)
+✨ **What this project does** (in plain terms)
 
 For the currently checked-out Git commit:
-	1.	Finds the exact Vercel deployment triggered by that commit
-	2.	Fetches its build logs
-	3.	Feeds the logs into Codex (local agent)
-	4.	Applies minimal, targeted code fixes
-	5.	Commits and pushes to your active branch
-	6.	Triggers a new Vercel deployment
-	7.	Repeats until the build succeeds or stops safely
+1. Finds the exact Vercel deployment triggered by that commit
+2. Fetches its build logs
+3. Feeds the logs into Codex (local agent)
+4. Applies minimal, targeted code fixes
+5. Commits and pushes to your active branch
+6. Triggers a new Vercel deployment
+7. Repeats until the build succeeds or stops safely
 
 This creates a closed-loop, commit-aware, zero-touch build repair system.
 
 ⸻
 
-🧠 Key design principles
-	•	Commit-centric (not URL-centric)
-Logs are matched to the exact Git commit, not just the production URL.
-		•	The script prefers `vercel list -m githubCommitSha=<sha>` to avoid false positives when scanning logs.
-	•	Safe automation
-Codex edits files but never commits. Git commits are done explicitly by the script.
-	•	CLI-first, version-agnostic
-Works even when vercel list --json is unavailable.
-	•	Self-terminating
-Stops when:
-	•	build succeeds
-	•	Codex makes no changes
-	•	max iterations reached
+🧠 **Key design principles**
+
+- Commit-centric (not URL-centric)  
+  Logs are matched to the exact Git commit using `vercel list -m githubCommitSha=<sha>` — avoids false positives.
+- Safe automation  
+  Codex edits files but **never commits**. Git operations are explicit and controlled by the script.
+- CLI-first, version-agnostic  
+  Works even when `vercel list --json` behaves unexpectedly.
+- Self-terminating  
+  Stops cleanly when: build succeeds, Codex makes no changes, or max iterations reached.
 
 ⸻
 
-🏗 Architecture Overview
-```txt
+🏗 **Architecture Overview**
+
+```
 ┌────────────────┐
 │ Git Commit     │
 └───────┬────────┘
@@ -63,20 +61,30 @@ Stops when:
 [5] Vercel redeploys
         ▼
 [6] Loop until success
+        │
+        ▼ (optional post-success)
+┌─────────────────────────────┐
+│ Local Next.js Harness Test  │ ← See companion tool below
+└─────────────────────────────┘
 ```
 
 ⸻
 
-📦 Requirements
-	•	Node.js 18+
-	•	Git
-	•	Vercel CLI (npm i -g vercel)
-	•	Codex CLI or Codex SDK
-	•	A Vercel project already connected to your repo
+📦 **Requirements**
+
+- Node.js 18+
+- Git
+- Vercel CLI (`npm i -g vercel`)
+- Codex CLI or Codex SDK
+- A Vercel project already connected to your repo
+
+**Recommended companion** (for faster local validation & agent debugging):  
+[Next.js Runtime Harness](https://github.com/your-org/nextjs-harness) — a fixed Docker base for isolated, reproducible Next.js runs (mount your repo, share global pnpm cache, healthchecks).
 
 ⸻
 
-📥 Installation
+📥 **Installation**
+
 ```bash
 git clone https://github.com/yankeemarco/vercel-codex-autofix.git
 cd vercel-codex-autofix
@@ -87,9 +95,10 @@ npm install -D ts-node typescript @types/node
 
 ⸻
 
-⚙️ Configuration (.env)
+⚙️ **Configuration** (`.env`)
 
-Create a .env file:
+Create `.env` in the script directory:
+
 ```
 # --- Vercel Authentication ---
 VERCEL_TOKEN=vcpat_your_token_here
@@ -118,78 +127,57 @@ MCP_GUI_LOG_DIR=         # override logs dir if needed
 MCP_GUI_ROUTES=          # override routes file if needed
 # Where runtime assets live (defaults to <REPO_PATH>/vercel_codex_autofix)
 VERCEL_CODEX_RUNTIME=
-# Routes live in <runtime>/mcp/gui-routes.json (auto-generates gui-tests.md)
 ```
 
-Note:
-	•	The script loads `.env` from the same directory as `vercel_codex_loop.ts` (so you can run it from any working directory).
-	•	To override, set `DOTENV_CONFIG_PATH=/path/to/.env`.
-	•	If `GIT_BRANCH` is set but doesn’t exist locally, the script falls back to your current branch.
+Note: Script loads `.env` relative to `vercel_codex_loop.ts`. Override with `DOTENV_CONFIG_PATH=/path/to/.env`.
 
-🔑 Vercel token
-
-Create at:
-👉 https://vercel.com/account/tokens
+🔑 **Vercel token**  
+Create at: https://vercel.com/account/tokens
 
 ⸻
 
-▶️ How to run (important)
+▶️ **How to run** (recommended)
 
-✅ Correct, recommended command
-
+```bash
 CODEX_USE_EXEC=1 npx ts-node ~/Documents/vercel-codex-autofix/vercel_codex_loop.ts
-
-What this does
-	•	Uses Codex CLI (codex exec --full-auto)
-	•	Detects your currently checked-out Git branch
-	•	Pushes to that active branch (e.g. master or main)
-	•	Avoids refspec errors by not hardcoding branch names
-
-You do not need to pass --ref or specify a branch manually.
-
-Optional: kick off an initial task before the build-log loop
-	•	Append any free-form instruction after the script path; e.g.:
-
-```
-CODEX_USE_EXEC=1 npx ts-node ~/Documents/vercel-codex-autofix/vercel_codex_loop.ts "add facebook auth"
 ```
 
-	•	The quoted text is handed to Codex before the usual Vercel log iterations, ideal for “please build X feature” tasks.
-	•	Passing an empty string (e.g., `""`, `''`, or whitespace) explicitly skips the initial-task phase if you want log-based repair only.
+- Auto-detects current branch & pushes to it
+- No manual `--ref` or branch args needed
 
-Optional: trigger the MCP Playwright GUI scout manually
-	•	After the first run, all runtime assets land under `<your-repo>/vercel_codex_autofix/`. Run the helper script there (it shells out to `npx @playwright/mcp` using the auto-generated intent spec):
+**Optional initial task** (e.g. feature request before log loop):
 
+```bash
+CODEX_USE_EXEC=1 npx ts-node .../vercel_codex_loop.ts "add facebook auth"
 ```
+
+Empty string `""` skips initial task.
+
+**Manual MCP GUI check** (post-first-run):
+
+```bash
 bash vercel_codex_autofix/mcp/run-gui-check.sh https://your-app.vercel.app
 ```
 
-	•	Artifacts (trace/video/report) land in `vercel_codex_autofix/logs/gui/` and `vercel_codex_autofix/.autofix/gui_report.md`.
-	•	The loop automatically regenerates `vercel_codex_autofix/mcp/gui-tests.md` + `.../gui-plan.generated.json` from the routes listed in `vercel_codex_autofix/mcp/gui-routes.json`, then runs the same script after each successful deployment and feeds any FAIL sections straight into Codex.
+Artifacts → `vercel_codex_autofix/logs/gui/` + `.autofix/gui_report.md`
 
 ⸻
 
-🔄 What happens when you run it
-	1.	Reads your current commit hash
-	2.	Runs vercel list
-	3.	Inspects deployments until it finds one containing that commit
-	4.	Fetches logs via:
+🔄 **What happens when you run it**
 
-vercel inspect <deployment> --logs --wait
-
-
-	5.	Writes logs to dev_debug_logs.md
-	6.	Runs Codex with clear autofix instructions
-	7.	If files changed:
-	•	git add -A
-	•	git commit
-	•	git push origin <active-branch>
-	8.	Waits and repeats
-	9.	When Vercel declares the deployment successful, runs `vercel_codex_autofix/mcp/run-gui-check.sh` (if enabled); GUI failures feed fresh logs back into Codex, passing runs stop the loop
+1. Reads current commit hash
+2. Finds matching deployment via `vercel list`
+3. Fetches logs: `vercel inspect <deployment> --logs --wait`
+4. Writes to `dev_debug_logs.md`
+5. Runs Codex with autofix prompt
+6. If changes → `git add -A`, commit, push to active branch
+7. Wait → repeat
+8. On success → runs MCP GUI scout (if enabled); GUI fails → feed back to Codex
 
 ⸻
 
-🧪 Example output
+🧪 **Example output**
+
 ```
 [start] Vercel ↔ Codex auto-fix loop (TypeScript)
 Repo:   /Users/jacky/Documents/zeda_video
@@ -208,63 +196,103 @@ Iteration 1/10
 
 ⸻
 
-🧪 MCP Playwright GUI scout
-	•	Declare the routes you care about in `<REPO>/vercel_codex_autofix/mcp/gui-routes.json` (just name + path + optional description); the loop regenerates `gui-tests.md` and `gui-plan.generated.json` automatically from that file before every MCP run. (Set `VERCEL_CODEX_RUNTIME` to change the base directory.)
-	•	After Vercel reports a successful build, the loop executes `vercel_codex_autofix/mcp/run-gui-check.sh`, which shells out to `npx @playwright/mcp` with the freshly generated intent spec and the config in `vercel_codex_autofix/mcp/playwright.config.json`.
-	•	The helper writes a summarized PASS/FAIL report to `vercel_codex_autofix/.autofix/gui_report.md`; when it contains “FAIL”, that file becomes Codex’s new log source for the next autofix turn, along with traces/videos saved in `vercel_codex_autofix/logs/gui/`.
-	•	Set `RUN_MCP_GUI=0` to disable this stage, or override `MCP_GUI_SCRIPT` / `MCP_GUI_LOG_DIR` / `MCP_GUI_ROUTES` / `VERCEL_CODEX_RUNTIME` if you relocate the assets.
-	•	Run the script manually at any time via `bash vercel_codex_autofix/mcp/run-gui-check.sh https://your-app.vercel.app` (after updating `vercel_codex_autofix/mcp/gui-routes.json`) to reproduce GUI regressions locally.
+🧪 **MCP Playwright GUI scout**
+
+- Define routes in `<REPO>/vercel_codex_autofix/mcp/gui-routes.json`
+- Loop auto-generates `gui-tests.md` + `gui-plan.generated.json`
+- On successful deploy → runs `npx @playwright/mcp` via helper script
+- FAIL reports → become next Codex input + traces/videos saved
+- Disable: `RUN_MCP_GUI=0`
+- Manual run: `bash vercel_codex_autofix/mcp/run-gui-check.sh https://your-app.vercel.app`
 
 ⸻
 
-🛑 Stop conditions (safety)
+🛑 **Stop conditions** (safety)
 
-The loop stops when any is true:
-	•	Build logs indicate success
-	•	Codex makes no file changes
-	•	Git has nothing to commit
-	•	MAX_ITERATIONS reached
+Loop exits when:
+- Build logs show success
+- Codex makes no changes
+- Git has nothing to commit
+- `MAX_ITERATIONS` reached
 
 No infinite loops.
 
 ⸻
 
-🔧 Customization ideas
-	•	Replace success heuristics with stricter checks
-	•	Switch to PR mode instead of direct push
-	•	Add multiple Codex passes
-	•	Add structured error classification
-	•	Integrate with GitHub Actions
+🔧 **Customization ideas**
 
-🧯 Stability tips (avoid A↔B oscillation)
-	•	Add regression bundles: store error signature + repro command for each fix; rerun the last N repros on every patch.
-	•	Canonicalize logs into signatures (tool/code/file/line/normalized message) and treat repeats as regressions.
-	•	Enforce monotonic progress with a score (e.g., 1000*build failures + 50*ts errors + 10*lint + test fails) — reject non-improving patches.
-	•	Freeze high-risk files (lockfiles, tsconfig, root configs) unless explicitly required and justified.
-	•	Keep decision records (why we picked a fix and rejected alternatives) and feed them to the agent to prevent reverts.
-	•	Use propose→critic passes: one agent patches, another verifies regressions/forbidden files before accepting.
+- Replace success heuristics with stricter checks
+- Switch to PR mode (instead of direct push)
+- Add multiple Codex passes
+- Integrate structured error classification
+- **Run local Next.js Harness tests** after each successful deploy (before MCP GUI) for fast smoke/validation
+- GitHub Actions runner
+- Multi-agent repair strategies
 
-⛑️ Troubleshooting
-	•	Codex CLI error `invalid_encrypted_content`: clear stale credentials and re-login with ChatGPT auth:
+⸻
+
+🧯 **Stability tips** (avoid A↔B oscillation)
+
+- Add regression bundles: store error signatures + repros
+- Canonicalize logs into signatures → detect repeats
+- Enforce monotonic progress (failure score)
+- Freeze high-risk files (lockfiles, tsconfig, etc.)
+- Keep decision records for agent learning
+- Propose → critic multi-agent passes
+
+⸻
+
+🧰 **Companion: Next.js Runtime Harness**
+
+For local, reproducible Next.js testing (great for pre-commit validation or Codex debugging):
+
+Use the fixed Docker harness: https://github.com/your-org/nextjs-harness (or similar)
+
+Quick example (mount your repo):
+
+```bash
+docker run --rm -it \
+  -p 3000:3000 \
+  -v /path/to/your-project:/workspace \
+  -v pnpm-store:/pnpm-store \
+  -w /workspace \
+  --health-cmd="curl -f http://localhost:3000 || exit 1" \
+  nextjs-harness:node24 \
+  sh -c "pnpm install && pnpm dev"
 ```
+
+- Global named volume `pnpm-store` (create once: `docker volume create pnpm-store`)
+- Shared cache → fast installs across projects
+- Healthcheck → reliable MCP/automation signals
+
+Add to your workflow: run this after each successful Vercel deploy for local smoke test before GUI scout.
+
+⸻
+
+⛑️ **Troubleshooting**
+
+Codex CLI `invalid_encrypted_content`:
+```bash
 codex logout
 rm -rf ~/.codex/sessions ~/.codex/auth.json
 codex --config preferred_auth_method=chatgpt
 codex login
-codex whoami   # sanity check
+codex whoami
 ```
 
 ⸻
 
-🌱 Roadmap
-	•	GitHub Actions runner
-	•	PR-based autofix mode
-	•	Multi-agent repair strategies
-	•	Native Vercel API integration
-	•	Build-log diff intelligence
+🌱 **Roadmap**
+
+- GitHub Actions runner
+- PR-based autofix mode
+- Multi-agent repair strategies
+- Native Vercel API integration
+- Build-log diff intelligence
+- **Tight integration with Next.js Runtime Harness** for local pre-verification loops
 
 ⸻
 
-📄 License
+📄 **License**
 
 MIT License.
