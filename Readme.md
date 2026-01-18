@@ -246,7 +246,6 @@ No infinite loops.
 
 For local, reproducible Next.js testing (great for pre-commit validation or Codex debugging):
 
-Use the fixed Docker harness: https://github.com/your-org/nextjs-harness (or similar)
 
 Quick example (mount your repo):
 
